@@ -677,6 +677,7 @@ data InstallFlags = InstallFlags {
     installReinstall        :: Flag Bool,
     installAvoidReinstalls  :: Flag Bool,
     installOverrideReinstall :: Flag Bool,
+    installRebuildBroken    :: Flag Bool,
     installUpgradeDeps      :: Flag Bool,
     installOnly             :: Flag Bool,
     installOnlyDeps         :: Flag Bool,
@@ -701,6 +702,7 @@ defaultInstallFlags = InstallFlags {
     installReinstall       = Flag False,
     installAvoidReinstalls = Flag False,
     installOverrideReinstall = Flag False,
+    installRebuildBroken   = Flag False,
     installUpgradeDeps     = Flag False,
     installOnly            = Flag False,
     installOnlyDeps        = Flag False,
@@ -816,6 +818,11 @@ installOptions showOrParseArgs =
           installOverrideReinstall (\v flags -> flags { installOverrideReinstall = v })
           (yesNoOpt showOrParseArgs)
 
+      , option [] ["rebuild-broken"]
+          "Reinstall packages and attempt to rebuild packages which they might break"
+          installRebuildBroken (\v flags -> flags { installRebuildBroken = v })
+          (yesNoOpt showOrParseArgs)
+
       , option [] ["upgrade-dependencies"]
           "Pick the latest version for all dependencies, rather than trying to pick an installed version."
           installUpgradeDeps (\v flags -> flags { installUpgradeDeps = v })
@@ -899,6 +906,7 @@ instance Monoid InstallFlags where
     installReinstall       = mempty,
     installAvoidReinstalls = mempty,
     installOverrideReinstall = mempty,
+    installRebuildBroken   = mempty,
     installMaxBackjumps    = mempty,
     installUpgradeDeps     = mempty,
     installReorderGoals    = mempty,
@@ -921,6 +929,7 @@ instance Monoid InstallFlags where
     installReinstall       = combine installReinstall,
     installAvoidReinstalls = combine installAvoidReinstalls,
     installOverrideReinstall = combine installOverrideReinstall,
+    installRebuildBroken   = combine installRebuildBroken,
     installMaxBackjumps    = combine installMaxBackjumps,
     installUpgradeDeps     = combine installUpgradeDeps,
     installReorderGoals    = combine installReorderGoals,
