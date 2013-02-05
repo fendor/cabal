@@ -82,6 +82,7 @@ import qualified Distribution.Client.PackageIndex as SourcePackageIndex
 import qualified Distribution.Client.Win32SelfUpgrade as Win32SelfUpgrade
 import qualified Distribution.Client.World as World
 import qualified Distribution.InstalledPackageInfo as Installed
+import Distribution.ModuleName (ModuleName)
 import Paths_cabal_install (getBinDir)
 import Distribution.Client.JobControl
 
@@ -271,7 +272,19 @@ planPackages comp solver configFlags configExFlags installFlags
           solver
           resolverParams
 
-    >>= if onlyDeps then pruneInstallPlan pkgSpecifiers else return
+    >>= (if onlyDeps then pruneInstallPlan pkgSpecifiers else return)
+    >>= \installPlan->
+            let details = planDetails installedPkgIndex installPlan pkgSpecifiers
+            in case newBrokenPkgs details of
+                   broken | not (null broken) && rebuildBroken ->
+                       let rebuild = map (\x->maybe (error $ "asdf: "++show x) id -- FIXME
+                                         $ SourcePackageIndex.lookupPackageId (packageIndex sourcePkgDb)
+                                         $ Installed.sourcePackageId x
+                                         ) broken
+                       in planPackages comp solver configFlags configExFlags
+                           installFlags installedPkgIndex sourcePkgDb
+                           (pkgSpecifiers++map SpecificSourcePackage rebuild)
+                   _ | otherwise -> return installPlan
 
   where
     resolverParams =
@@ -330,6 +343,7 @@ planPackages comp solver configFlags configExFlags installFlags
     maxBackjumps     = fromFlag (installMaxBackjumps     installFlags)
     upgradeDeps      = fromFlag (installUpgradeDeps      installFlags)
     onlyDeps         = fromFlag (installOnlyDeps         installFlags)
+    rebuildBroken    = fromFlag (installRebuildBroken    installFlags)
 
 -- | Remove the provided targets from the install plan.
 pruneInstallPlan :: Package pkg => [PackageSpecifier pkg] -> InstallPlan
@@ -358,6 +372,44 @@ pruneInstallPlan pkgSpecifiers =
               , packageName depid `elem` targetnames ]
 
     targetnames  = map pkgSpecifierTarget pkgSpecifiers
+
+-- | Details concerning the implications of a 'InstallPlan'
+data PlanDetails = PlanDetails { newBrokenPkgs   :: [Installed.InstalledPackageInfo_ ModuleName]
+                                 -- ^ Packages that will be broken as a result of the plan
+                               , reinstalledPkgs :: [InstalledPackageId]
+                                 -- ^ Packages that will be reinstalled
+                               }
+                 deriving (Show)
+     
+planDetails :: PackageIndex
+            -> InstallPlan
+            -> [PackageSpecifier SourcePackage]
+            -> PlanDetails
+planDetails installed installPlan pkgSpecifiers = 
+  -- User targets that are already installed.
+  let preExistingTargets =
+        [ p | let tgts = map pkgSpecifierTarget pkgSpecifiers,
+              InstallPlan.PreExisting p <- InstallPlan.toList installPlan,
+              packageName p `elem` tgts ]
+      lPlan = linearizeInstallPlan installed installPlan
+  -- Are any packages classified as reinstalls?
+      reinstalledPkgs = concatMap (extractReinstalls . snd) lPlan
+  -- Packages that are already broken.
+      oldBrokenPkgs =
+          map Installed.installedPackageId
+        . PackageIndex.reverseDependencyClosure installed
+        . map (Installed.installedPackageId . fst)
+        . PackageIndex.brokenPackages
+        $ installed
+      excluded = reinstalledPkgs ++ oldBrokenPkgs
+  -- Packages that are reverse dependencies of replaced packages are very
+  -- likely to be broken. We exclude packages that are already broken.
+      newBrokenPkgs =
+        filter (\ p -> not (Installed.installedPackageId p `elem` excluded))
+               (PackageIndex.reverseDependencyClosure installed reinstalledPkgs)
+  in PlanDetails { newBrokenPkgs   = newBrokenPkgs
+                 , reinstalledPkgs = reinstalledPkgs
+                 }
 
 -- ------------------------------------------------------------
 -- * Informational messages
@@ -389,24 +441,11 @@ checkPrintPlan verbosity installed installPlan sourcePkgDb
        : map (display . packageId) preExistingTargets
       ++ ["Use --reinstall if you want to reinstall anyway."]
 
-  let lPlan = linearizeInstallPlan installed installPlan
-  -- Are any packages classified as reinstalls?
-  let reinstalledPkgs = concatMap (extractReinstalls . snd) lPlan
-  -- Packages that are already broken.
-  let oldBrokenPkgs =
-          map Installed.installedPackageId
-        . PackageIndex.reverseDependencyClosure installed
-        . map (Installed.installedPackageId . fst)
-        . PackageIndex.brokenPackages
-        $ installed
-  let excluded = reinstalledPkgs ++ oldBrokenPkgs
-  -- Packages that are reverse dependencies of replaced packages are very
-  -- likely to be broken. We exclude packages that are already broken.
-  let newBrokenPkgs =
-        filter (\ p -> not (Installed.installedPackageId p `elem` excluded))
-               (PackageIndex.reverseDependencyClosure installed reinstalledPkgs)
-  let containsReinstalls = not (null reinstalledPkgs)
-  let breaksPkgs         = not (null newBrokenPkgs)
+  let PlanDetails newBrokenPkgs reinstalledPkgs =
+          planDetails installed installPlan pkgSpecifiers
+      containsReinstalls = not $ null reinstalledPkgs
+      breaksPkgs = not $ null newBrokenPkgs
+      lPlan = linearizeInstallPlan installed installPlan
 
   let adaptedVerbosity
         | containsReinstalls && not overrideReinstall = verbosity `max` verbose
@@ -424,14 +463,17 @@ checkPrintPlan verbosity installed installPlan sourcePkgDb
   when containsReinstalls $ do
     if breaksPkgs
       then do
-        (if dryRun || overrideReinstall then warn verbosity else die) $ unlines $
+        (if dryRun || overrideReinstall || rebuildBroken then warn verbosity else die) $ unlines $
             "The following packages are likely to be broken by the reinstalls:"
           : map (display . Installed.sourcePackageId) newBrokenPkgs
-          ++ if overrideReinstall
-               then if dryRun then [] else
-                 ["Continuing even though the plan contains dangerous reinstalls."]
-               else
-                 ["Use --force-reinstalls if you want to install anyway."]
+          ++ case () of
+                 _ | overrideReinstall && dryRun -> []
+                 _ | overrideReinstall && rebuildBroken ->
+                     ["These packages will be reinstalled"]
+                 _ | overrideReinstall ->
+                     ["Continuing even though the plan contains dangerous reinstalls."]
+                 _ | otherwise ->
+                     ["Use --force-reinstalls if you want to install anyway."]
       else unless dryRun $ warn verbosity
              "Note that reinstalls are always dangerous. Continuing anyway..."
 
@@ -440,6 +482,7 @@ checkPrintPlan verbosity installed installPlan sourcePkgDb
 
     dryRun            = fromFlag (installDryRun            installFlags)
     overrideReinstall = fromFlag (installOverrideReinstall installFlags)
+    rebuildBroken     = fromFlag (installRebuildBroken     installFlags)
 
 linearizeInstallPlan :: PackageIndex
                      -> InstallPlan
