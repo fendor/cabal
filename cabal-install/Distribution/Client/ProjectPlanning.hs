@@ -2980,7 +2980,13 @@ setupHsConfigureFlags (ReadyPackage elab@ElaboratedConfiguredPackage{..})
                                   ElabComponent _ -> toFlag elabComponentId
 
     configProgramPaths        = Map.toList elabProgramPaths
-    configProgramArgs         = Map.toList elabProgramArgs
+    configProgramArgs
+        | elabSetupScriptCliVersion < mkVersion [1,24,2]
+          -- workaround for https://github.com/haskell/cabal/issues/4010
+                              = Map.toList $
+                                Map.insertWith (++) "ghc" ["-hide-all-packages"]
+                                               elabProgramArgs
+        | otherwise           = Map.toList elabProgramArgs
     configProgramPathExtra    = toNubList elabProgramPathExtra
     configHcFlavor            = toFlag (compilerFlavor pkgConfigCompiler)
     configHcPath              = mempty -- we use configProgramPaths instead
