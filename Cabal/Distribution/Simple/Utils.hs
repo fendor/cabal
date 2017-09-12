@@ -211,7 +211,8 @@ import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 import System.Directory
     ( Permissions(executable), getDirectoryContents, getPermissions
     , doesDirectoryExist, doesFileExist, removeFile, findExecutable
-    , getModificationTime, createDirectory, removeDirectoryRecursive )
+    , getModificationTime, createDirectory, removeDirectoryRecursive
+    , getCurrentDirectory )
 import System.Environment
     ( getProgName )
 import System.Exit
@@ -695,17 +696,21 @@ maybeExit cmd = do
 
 printRawCommandAndArgs :: Verbosity -> FilePath -> [String] -> IO ()
 printRawCommandAndArgs verbosity path args = withFrozenCallStack $
-    printRawCommandAndArgsAndEnv verbosity path args Nothing
+    printRawCommandAndArgsAndEnv verbosity path args Nothing Nothing
 
 printRawCommandAndArgsAndEnv :: Verbosity
                              -> FilePath
                              -> [String]
+                             -> Maybe FilePath
                              -> Maybe [(String, String)]
                              -> IO ()
-printRawCommandAndArgsAndEnv verbosity path args menv = do
+printRawCommandAndArgsAndEnv verbosity path args mcwd menv = do
     case menv of
         Just env -> debugNoWrap verbosity ("Environment: " ++ show env)
-        Nothing -> return ()
+        Nothing  -> return ()
+    let withCwd dir = "cwd ("++dir++")"
+    cwd <- maybe (fmap withCwd getCurrentDirectory) pure mcwd
+    debugNoWrap verbosity ("Working directory: " ++ show cwd)
     infoNoWrap verbosity (showCommandForUser path args)
 
 -- Exit with the same exit code if the subcommand fails
@@ -733,7 +738,7 @@ rawSystemExitWithEnv :: Verbosity
                      -> [(String, String)]
                      -> IO ()
 rawSystemExitWithEnv verbosity path args env = withFrozenCallStack $ do
-    printRawCommandAndArgsAndEnv verbosity path args (Just env)
+    printRawCommandAndArgsAndEnv verbosity path args Nothing (Just env)
     hFlush stdout
     (_,_,_,ph) <- createProcess $
                   (Process.proc path args) { Process.env = (Just env)
@@ -784,7 +789,7 @@ createProcessWithEnv ::
   -- ^ Any handles created for stdin, stdout, or stderr
   -- with 'CreateProcess', and a handle to the process.
 createProcessWithEnv verbosity path args mcwd menv inp out err = withFrozenCallStack $ do
-    printRawCommandAndArgsAndEnv verbosity path args menv
+    printRawCommandAndArgsAndEnv verbosity path args mcwd menv
     hFlush stdout
     (inp', out', err', ph) <- createProcess $
                                 (Process.proc path args) {
@@ -829,7 +834,7 @@ rawSystemStdInOut :: Verbosity
                   -> IODataMode               -- ^ output in binary mode
                   -> IO (IOData, String, ExitCode) -- ^ output, errors, exit
 rawSystemStdInOut verbosity path args mcwd menv input outputMode = withFrozenCallStack $ do
-  printRawCommandAndArgs verbosity path args
+  printRawCommandAndArgsAndEnv verbosity path args mcwd menv
 
   Exception.bracket
      (runInteractiveProcess path args mcwd menv)
