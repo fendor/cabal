@@ -1,5 +1,3 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE PatternGuards #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Lex
@@ -14,22 +12,9 @@ module Distribution.Lex (
         tokenizeQuotedWords
  ) where
 
-import Data.Char (isSpace)
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid
-#endif
-
-newtype DList a = DList ([a] -> [a])
-
-runDList :: DList a -> [a]
-runDList (DList run) = run []
-
-singleton :: a -> DList a
-singleton a = DList (a:)
-
-instance Monoid (DList a) where
-  mempty = DList id
-  DList a `mappend` DList b = DList (a . b)
+import Prelude ()
+import Distribution.Compat.Prelude
+import Distribution.Compat.DList
 
 tokenizeQuotedWords :: String -> [String]
 tokenizeQuotedWords = filter (not . null) . go False mempty

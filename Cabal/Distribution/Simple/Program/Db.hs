@@ -1,5 +1,6 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -51,6 +52,7 @@ module Distribution.Simple.Program.Db (
     -- ** Query and manipulate the program db
     configureProgram,
     configureAllKnownPrograms,
+    unconfigureProgram,
     lookupProgramVersion,
     reconfigurePrograms,
     requireProgram,
@@ -58,33 +60,20 @@ module Distribution.Simple.Program.Db (
 
   ) where
 
-import Distribution.Simple.Program.Types
-         ( Program(..), ProgArg, ConfiguredProgram(..), ProgramLocation(..) )
-import Distribution.Simple.Program.Find
-         ( ProgramSearchPath, defaultProgramSearchPath
-         , findProgramOnSearchPath, programSearchPathAsPATHVar )
-import Distribution.Simple.Program.Builtin
-         ( builtinPrograms )
-import Distribution.Simple.Utils
-         ( die, doesExecutableExist )
-import Distribution.Version
-         ( Version, VersionRange, isAnyVersion, withinRange )
-import Distribution.Text
-         ( display )
-import Distribution.Verbosity
-         ( Verbosity )
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Distribution.Compat.Binary (Binary(..))
-#if __GLASGOW_HASKELL__ < 710
-import Data.Functor ((<$>))
-#endif
-import Data.List
-         ( foldl' )
-import Data.Maybe
-         ( catMaybes )
+import Distribution.Simple.Program.Types
+import Distribution.Simple.Program.Find
+import Distribution.Simple.Program.Builtin
+import Distribution.Simple.Utils
+import Distribution.Version
+import Distribution.Text
+import Distribution.Verbosity
+
+import Control.Monad (join)
+import Data.Tuple (swap)
 import qualified Data.Map as Map
-import Control.Monad
-         ( join, foldM )
 
 -- ------------------------------------------------------------
 -- * Programs database
@@ -103,6 +92,7 @@ data ProgramDb = ProgramDb {
         progSearchPath    :: ProgramSearchPath,
         configuredProgs   :: ConfiguredProgs
     }
+  deriving (Typeable)
 
 type UnconfiguredProgram = (Program, Maybe FilePath, [ProgArg])
 type UnconfiguredProgs   = Map.Map String UnconfiguredProgram
@@ -119,38 +109,52 @@ defaultProgramDb = restoreProgramDb builtinPrograms emptyProgramDb
 -- internal helpers:
 updateUnconfiguredProgs :: (UnconfiguredProgs -> UnconfiguredProgs)
                         -> ProgramDb -> ProgramDb
-updateUnconfiguredProgs update conf =
-  conf { unconfiguredProgs = update (unconfiguredProgs conf) }
+updateUnconfiguredProgs update progdb =
+  progdb { unconfiguredProgs = update (unconfiguredProgs progdb) }
 
 updateConfiguredProgs :: (ConfiguredProgs -> ConfiguredProgs)
                       -> ProgramDb -> ProgramDb
-updateConfiguredProgs update conf =
-  conf { configuredProgs = update (configuredProgs conf) }
+updateConfiguredProgs update progdb =
+  progdb { configuredProgs = update (configuredProgs progdb) }
 
 
 -- Read & Show instances are based on listToFM
--- Note that we only serialise the configured part of the database, this is
--- because we don't need the unconfigured part after the configure stage, and
--- additionally because we cannot read/show 'Program' as it contains functions.
+
+-- | Note that this instance does not preserve the known 'Program's.
+-- See 'restoreProgramDb' for details.
+--
 instance Show ProgramDb where
   show = show . Map.toAscList . configuredProgs
 
+-- | Note that this instance does not preserve the known 'Program's.
+-- See 'restoreProgramDb' for details.
+--
 instance Read ProgramDb where
   readsPrec p s =
     [ (emptyProgramDb { configuredProgs = Map.fromList s' }, r)
     | (s', r) <- readsPrec p s ]
 
+-- | Note that this instance does not preserve the known 'Program's.
+-- See 'restoreProgramDb' for details.
+--
 instance Binary ProgramDb where
-  put = put . configuredProgs
+  put db = do
+    put (progSearchPath db)
+    put (configuredProgs db)
+
   get = do
-      progs <- get
-      return $! emptyProgramDb { configuredProgs = progs }
+    searchpath <- get
+    progs      <- get
+    return $! emptyProgramDb {
+      progSearchPath  = searchpath,
+      configuredProgs = progs
+    }
 
 
--- | The Read\/Show instance does not preserve all the unconfigured 'Programs'
--- because 'Program' is not in Read\/Show because it contains functions. So to
--- fully restore a deserialised 'ProgramDb' use this function to add
--- back all the known 'Program's.
+-- | The 'Read'\/'Show' and 'Binary' instances do not preserve all the
+-- unconfigured 'Programs' because 'Program' is not in 'Read'\/'Show' because
+-- it contains functions. So to fully restore a deserialised 'ProgramDb' use
+-- this function to add back all the known 'Program's.
 --
 -- * It does not add the default programs, but you probably want them, use
 --   'builtinPrograms' in addition to any extra you might need.
@@ -171,7 +175,7 @@ addKnownProgram prog = updateUnconfiguredProgs $
 
 
 addKnownPrograms :: [Program] -> ProgramDb -> ProgramDb
-addKnownPrograms progs conf = foldl' (flip addKnownProgram) conf progs
+addKnownPrograms progs progdb = foldl' (flip addKnownProgram) progdb progs
 
 
 lookupKnownProgram :: String -> ProgramDb -> Maybe Program
@@ -180,9 +184,9 @@ lookupKnownProgram name =
 
 
 knownPrograms :: ProgramDb -> [(Program, Maybe ConfiguredProgram)]
-knownPrograms conf =
-  [ (p,p') | (p,_,_) <- Map.elems (unconfiguredProgs conf)
-           , let p' = Map.lookup (programName p) (configuredProgs conf) ]
+knownPrograms progdb =
+  [ (p,p') | (p,_,_) <- Map.elems (unconfiguredProgs progdb)
+           , let p' = Map.lookup (programName p) (configuredProgs progdb) ]
 
 -- | Get the current 'ProgramSearchPath' used by the 'ProgramDb'.
 -- This is the default list of locations where programs are looked for when
@@ -223,8 +227,8 @@ userSpecifyPath name path = updateUnconfiguredProgs $
 
 userMaybeSpecifyPath :: String -> Maybe FilePath
                      -> ProgramDb -> ProgramDb
-userMaybeSpecifyPath _    Nothing conf     = conf
-userMaybeSpecifyPath name (Just path) conf = userSpecifyPath name path conf
+userMaybeSpecifyPath _    Nothing progdb     = progdb
+userMaybeSpecifyPath name (Just path) progdb = userSpecifyPath name path progdb
 
 
 -- |User-specify the arguments for this program.  Basically override
@@ -249,8 +253,8 @@ userSpecifyArgs name args' =
 userSpecifyPaths :: [(String, FilePath)]
                  -> ProgramDb
                  -> ProgramDb
-userSpecifyPaths paths conf =
-  foldl' (\conf' (prog, path) -> userSpecifyPath prog path conf') conf paths
+userSpecifyPaths paths progdb =
+  foldl' (\progdb' (prog, path) -> userSpecifyPath prog path progdb') progdb paths
 
 
 -- | Like 'userSpecifyPath' but for a list of progs and their args.
@@ -258,8 +262,8 @@ userSpecifyPaths paths conf =
 userSpecifyArgss :: [(String, [ProgArg])]
                  -> ProgramDb
                  -> ProgramDb
-userSpecifyArgss argss conf =
-  foldl' (\conf' (prog, args) -> userSpecifyArgs prog args conf') conf argss
+userSpecifyArgss argss progdb =
+  foldl' (\progdb' (prog, args) -> userSpecifyArgs prog args progdb') progdb argss
 
 
 -- | Get the path that has been previously specified for a program, if any.
@@ -316,37 +320,40 @@ configureProgram :: Verbosity
                  -> Program
                  -> ProgramDb
                  -> IO ProgramDb
-configureProgram verbosity prog conf = do
+configureProgram verbosity prog progdb = do
   let name = programName prog
-  maybeLocation <- case userSpecifiedPath prog conf of
-    Nothing   -> programFindLocation prog verbosity (progSearchPath conf)
-             >>= return . fmap FoundOnSystem
+  maybeLocation <- case userSpecifiedPath prog progdb of
+    Nothing   ->
+      programFindLocation prog verbosity (progSearchPath progdb)
+      >>= return . fmap (swap . fmap FoundOnSystem . swap)
     Just path -> do
       absolute <- doesExecutableExist path
       if absolute
-        then return (Just (UserSpecified path))
-        else findProgramOnSearchPath verbosity (progSearchPath conf) path
-         >>= maybe (die notFound) (return . Just . UserSpecified)
+        then return (Just (UserSpecified path, []))
+        else findProgramOnSearchPath verbosity (progSearchPath progdb) path
+             >>= maybe (die' verbosity notFound)
+                       (return . Just . swap . fmap UserSpecified . swap)
       where notFound = "Cannot find the program '" ++ name
                      ++ "'. User-specified path '"
                      ++ path ++ "' does not refer to an executable and "
                      ++ "the program is not on the system path."
   case maybeLocation of
-    Nothing -> return conf
-    Just location -> do
+    Nothing -> return progdb
+    Just (location, triedLocations) -> do
       version <- programFindVersion prog verbosity (locationPath location)
-      newPath <- programSearchPathAsPATHVar (progSearchPath conf)
+      newPath <- programSearchPathAsPATHVar (progSearchPath progdb)
       let configuredProg        = ConfiguredProgram {
             programId           = name,
             programVersion      = version,
             programDefaultArgs  = [],
-            programOverrideArgs = userSpecifiedArgs prog conf,
+            programOverrideArgs = userSpecifiedArgs prog progdb,
             programOverrideEnv  = [("PATH", Just newPath)],
             programProperties   = Map.empty,
-            programLocation     = location
+            programLocation     = location,
+            programMonitorFiles = triedLocations
           }
       configuredProg' <- programPostConf prog verbosity configuredProg
-      return (updateConfiguredProgs (Map.insert name configuredProg') conf)
+      return (updateConfiguredProgs (Map.insert name configuredProg') progdb)
 
 
 -- | Configure a bunch of programs using 'configureProgram'. Just a 'foldM'.
@@ -355,21 +362,28 @@ configurePrograms :: Verbosity
                   -> [Program]
                   -> ProgramDb
                   -> IO ProgramDb
-configurePrograms verbosity progs conf =
-  foldM (flip (configureProgram verbosity)) conf progs
+configurePrograms verbosity progs progdb =
+  foldM (flip (configureProgram verbosity)) progdb progs
 
+
+-- | Unconfigure a program.  This is basically a hack and you shouldn't
+-- use it, but it can be handy for making sure a 'requireProgram'
+-- actually reconfigures.
+unconfigureProgram :: String -> ProgramDb -> ProgramDb
+unconfigureProgram progname =
+  updateConfiguredProgs $ Map.delete progname
 
 -- | Try to configure all the known programs that have not yet been configured.
 --
 configureAllKnownPrograms :: Verbosity
                           -> ProgramDb
                           -> IO ProgramDb
-configureAllKnownPrograms verbosity conf =
+configureAllKnownPrograms verbosity progdb =
   configurePrograms verbosity
-    [ prog | (prog,_,_) <- Map.elems notYetConfigured ] conf
+    [ prog | (prog,_,_) <- Map.elems notYetConfigured ] progdb
   where
-    notYetConfigured = unconfiguredProgs conf
-      `Map.difference` configuredProgs conf
+    notYetConfigured = unconfiguredProgs progdb
+      `Map.difference` configuredProgs progdb
 
 
 -- | reconfigure a bunch of programs given new user-specified args. It takes
@@ -381,14 +395,14 @@ reconfigurePrograms :: Verbosity
                     -> [(String, [ProgArg])]
                     -> ProgramDb
                     -> IO ProgramDb
-reconfigurePrograms verbosity paths argss conf = do
+reconfigurePrograms verbosity paths argss progdb = do
   configurePrograms verbosity progs
    . userSpecifyPaths paths
    . userSpecifyArgss argss
-   $ conf
+   $ progdb
 
   where
-    progs = catMaybes [ lookupKnownProgram name conf | (name,_) <- paths ]
+    progs = catMaybes [ lookupKnownProgram name progdb | (name,_) <- paths ]
 
 
 -- | Check that a program is configured and available to be run.
@@ -398,16 +412,16 @@ reconfigurePrograms verbosity paths argss conf = do
 --
 requireProgram :: Verbosity -> Program -> ProgramDb
                -> IO (ConfiguredProgram, ProgramDb)
-requireProgram verbosity prog conf = do
+requireProgram verbosity prog progdb = do
 
   -- If it's not already been configured, try to configure it now
-  conf' <- case lookupProgram prog conf of
-    Nothing -> configureProgram verbosity prog conf
-    Just _  -> return conf
+  progdb' <- case lookupProgram prog progdb of
+    Nothing -> configureProgram verbosity prog progdb
+    Just _  -> return progdb
 
-  case lookupProgram prog conf' of
-    Nothing             -> die notFound
-    Just configuredProg -> return (configuredProg, conf')
+  case lookupProgram prog progdb' of
+    Nothing             -> die' verbosity notFound
+    Just configuredProg -> return (configuredProg, progdb')
 
   where notFound       = "The program '" ++ programName prog
                       ++ "' is required but it could not be found."
@@ -443,7 +457,7 @@ lookupProgramVersion verbosity prog range programDb = do
           | otherwise                 ->
             return $! Left (badVersion version location)
         Nothing                       ->
-          return $! Left (noVersion location)
+          return $! Left (unknownVersion location)
 
   where notFound       = "The program '"
                       ++ programName prog ++ "'" ++ versionRequirement
@@ -452,7 +466,7 @@ lookupProgramVersion verbosity prog range programDb = do
                       ++ programName prog ++ "'" ++ versionRequirement
                       ++ " is required but the version found at "
                       ++ locationPath l ++ " is version " ++ display v
-        noVersion l    = "The program '"
+        unknownVersion l = "The program '"
                       ++ programName prog ++ "'" ++ versionRequirement
                       ++ " is required but the version of "
                       ++ locationPath l ++ " could not be determined."
@@ -467,5 +481,5 @@ requireProgramVersion :: Verbosity -> Program -> VersionRange
                       -> ProgramDb
                       -> IO (ConfiguredProgram, Version, ProgramDb)
 requireProgramVersion verbosity prog range programDb =
-  join $ either die return <$>
+  join $ either (die' verbosity) return `fmap`
   lookupProgramVersion verbosity prog range programDb

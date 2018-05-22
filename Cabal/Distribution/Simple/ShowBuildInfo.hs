@@ -68,14 +68,16 @@ import Distribution.Simple.Setup
 import Distribution.Simple.Utils (cabalVersion)
 import Distribution.Simple.Utils.Json
 import Distribution.Text
+import Distribution.Types.ForeignLib
+import Distribution.Types.TargetInfo
 
 -- | Construct a JSON document describing the build information for a package
 mkBuildInfo :: PackageDescription  -- ^ Mostly information from the .cabal file
             -> LocalBuildInfo      -- ^ Configuration information
             -> BuildFlags          -- ^ Flags that the user passed to build
-            -> [(ComponentName, ComponentLocalBuildInfo)]
+            -> [TargetInfo]
             -> Json
-mkBuildInfo pkg_descr lbi _flags componentsToBuild = info
+mkBuildInfo pkg_descr lbi _flags targetInfos = info
   where
     (.=) :: String -> Json -> (String, Json)
     k .= v = (k, v)
@@ -83,7 +85,7 @@ mkBuildInfo pkg_descr lbi _flags componentsToBuild = info
     info = JsonObject
       [ "cabal_version" .= JsonString (display cabalVersion)
       , "compiler" .= mkCompilerInfo
-      , "components" .= JsonArray (map mkComponentInfo componentsToBuild)
+      , "components" .= JsonArray (map mkComponentInfo targetInfos)
       ]
 
     mkCompilerInfo = JsonObject
@@ -95,7 +97,7 @@ mkBuildInfo pkg_descr lbi _flags componentsToBuild = info
         path = maybe JsonNull (JsonString . programPath)
                $ lookupProgram ghcProgram (withPrograms lbi)
 
-    mkComponentInfo (name, clbi) = JsonObject
+    mkComponentInfo targetInfo = JsonObject
       [ "type" .= JsonString compType
       , "name" .= JsonString (show name)
       , "compiler_args" .= JsonArray (map JsonString $ getCompilerArgs bi lbi clbi)
@@ -104,17 +106,21 @@ mkBuildInfo pkg_descr lbi _flags componentsToBuild = info
       , "source_dirs" .= JsonArray (map JsonString $ hsSourceDirs bi)
       ]
       where
+        clbi = targetCLBI targetInfo
+        name = componentLocalName clbi
         bi = componentBuildInfo comp
         Just comp = lookupComponent pkg_descr name
         compType = case comp of
           CLib _     -> "library"
+          CFLib _    -> "foreign-library"
           CExe _     -> "executable"
           CTest _    -> "test-suite"
           CBench _   -> "benchmark"
         modules = case comp of
-          CLib lib -> libModules lib
-          CExe exe -> exeModules exe
-          _        -> []
+          CLib lib  -> explicitLibModules lib
+          CFLib lib -> foreignLibModules lib
+          CExe exe  -> exeModules exe
+          _         -> []
         source_files = case comp of
           CLib _   -> []
           CExe exe -> [modulePath exe]
@@ -134,6 +140,6 @@ getCompilerArgs bi lbi clbi =
                        "build arguments for compiler "++show c
   where
     -- This is absolutely awful
-    ghc = GHC.renderGhcOptions (compiler lbi) baseOpts
+    ghc = GHC.renderGhcOptions (compiler lbi) (hostPlatform lbi) baseOpts
       where
         baseOpts = GHC.componentGhcOptions normal lbi bi clbi (buildDir lbi)

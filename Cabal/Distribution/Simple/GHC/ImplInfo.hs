@@ -14,10 +14,11 @@ module Distribution.Simple.GHC.ImplInfo (
         ghcVersionImplInfo, ghcjsVersionImplInfo, lhcVersionImplInfo
         ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Distribution.Simple.Compiler
-  ( Compiler(..), CompilerFlavor(..)
-  , compilerFlavor, compilerVersion, compilerCompatVersion )
-import Distribution.Version ( Version(..) )
+import Distribution.Version
 
 {- |
      Information about features and quirks of a GHC-based implementation.
@@ -33,23 +34,16 @@ import Distribution.Version ( Version(..) )
 -}
 
 data GhcImplInfo = GhcImplInfo
-  { hasCcOdirBug         :: Bool -- ^ bug in -odir handling for C compilations.
-  , flagInfoLanguages    :: Bool -- ^ --info and --supported-languages flags
-  , fakeRecordPuns       :: Bool -- ^ use -XRecordPuns for NamedFieldPuns
-  , flagStubdir          :: Bool -- ^ -stubdir flag supported
-  , flagOutputDir        :: Bool -- ^ -outputdir flag supported
-  , noExtInSplitSuffix   :: Bool -- ^ split-obj suffix does not contain p_o ext
-  , flagFfiIncludes      :: Bool -- ^ -#include on command line for FFI includes
-  , flagBuildingCabalPkg :: Bool -- ^ -fbuilding-cabal-package flag supported
-  , flagPackageId        :: Bool -- ^ -package-id / -package flags supported
-  , separateGccMingw     :: Bool -- ^ mingw and gcc are in separate directories
-  , supportsHaskell2010  :: Bool -- ^ -XHaskell2010 and -XHaskell98 flags
+  { supportsHaskell2010  :: Bool -- ^ -XHaskell2010 and -XHaskell98 flags
   , reportsNoExt         :: Bool -- ^ --supported-languages gives Ext and NoExt
   , alwaysNondecIndent   :: Bool -- ^ NondecreasingIndentation is always on
   , flagGhciScript       :: Bool -- ^ -ghci-script flag supported
   , flagProfAuto         :: Bool -- ^ new style -fprof-auto* flags
   , flagPackageConf      :: Bool -- ^ use package-conf instead of package-db
   , flagDebugInfo        :: Bool -- ^ -g flag supported
+  , supportsDebugLevels  :: Bool -- ^ supports numeric @-g@ levels
+  , supportsPkgEnvFiles  :: Bool -- ^ picks up @.ghc.environment@ files
+  , flagWarnMissingHomeModules :: Bool -- ^ -Wmissing-home-modules is supported
   }
 
 getImplInfo :: Compiler -> GhcImplInfo
@@ -66,46 +60,38 @@ getImplInfo comp =
                     ", but found " ++ show x)
 
 ghcVersionImplInfo :: Version -> GhcImplInfo
-ghcVersionImplInfo (Version v _) = GhcImplInfo
-  { hasCcOdirBug         = v <  [6,4,1]
-  , flagInfoLanguages    = v >= [6,7]
-  , fakeRecordPuns       = v >= [6,8] && v < [6,10]
-  , flagStubdir          = v >= [6,8]
-  , flagOutputDir        = v >= [6,10]
-  , noExtInSplitSuffix   = v <  [6,11]
-  , flagFfiIncludes      = v <  [6,11]
-  , flagBuildingCabalPkg = v >= [6,11]
-  , flagPackageId        = v >  [6,11]
-  , separateGccMingw     = v <  [6,12]
-  , supportsHaskell2010  = v >= [7]
+ghcVersionImplInfo ver = GhcImplInfo
+  { supportsHaskell2010  = v >= [7]
   , reportsNoExt         = v >= [7]
   , alwaysNondecIndent   = v <  [7,1]
   , flagGhciScript       = v >= [7,2]
   , flagProfAuto         = v >= [7,4]
   , flagPackageConf      = v <  [7,5]
   , flagDebugInfo        = v >= [7,10]
+  , supportsDebugLevels  = v >= [8,0]
+  , supportsPkgEnvFiles  = v >= [8,0,1,20160901] -- broken in 8.0.1, fixed in 8.0.2
+  , flagWarnMissingHomeModules = v >= [8,2]
   }
+  where
+    v = versionNumbers ver
 
-ghcjsVersionImplInfo :: Version -> Version -> GhcImplInfo
-ghcjsVersionImplInfo _ghcjsVer _ghcVer = GhcImplInfo
-  { hasCcOdirBug         = False
-  , flagInfoLanguages    = True
-  , fakeRecordPuns       = False
-  , flagStubdir          = True
-  , flagOutputDir        = True
-  , noExtInSplitSuffix   = False
-  , flagFfiIncludes      = False
-  , flagBuildingCabalPkg = True
-  , flagPackageId        = True
-  , separateGccMingw     = False
-  , supportsHaskell2010  = True
+ghcjsVersionImplInfo :: Version  -- ^ The GHCJS version
+                     -> Version  -- ^ The GHC version
+                     -> GhcImplInfo
+ghcjsVersionImplInfo _ghcjsver ghcver = GhcImplInfo
+  { supportsHaskell2010  = True
   , reportsNoExt         = True
   , alwaysNondecIndent   = False
   , flagGhciScript       = True
   , flagProfAuto         = True
   , flagPackageConf      = False
   , flagDebugInfo        = False
+  , supportsDebugLevels  = ghcv >= [8,0]
+  , supportsPkgEnvFiles  = ghcv >= [8,0,2] --TODO: check this works in ghcjs
+  , flagWarnMissingHomeModules = False
   }
+  where
+    ghcv = versionNumbers ghcver
 
 lhcVersionImplInfo :: Version -> GhcImplInfo
 lhcVersionImplInfo = ghcVersionImplInfo

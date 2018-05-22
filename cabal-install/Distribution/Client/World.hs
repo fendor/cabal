@@ -29,30 +29,31 @@ module Distribution.Client.World (
     getContents,
   ) where
 
-import Distribution.Package
-         ( Dependency(..) )
+import Prelude (sequence)
+import Distribution.Client.Compat.Prelude hiding (getContents)
+
+import Distribution.Types.Dependency
 import Distribution.PackageDescription
-         ( FlagAssignment, FlagName(FlagName) )
+         ( FlagAssignment, mkFlagAssignment, unFlagAssignment
+         , mkFlagName, unFlagName )
 import Distribution.Verbosity
          ( Verbosity )
 import Distribution.Simple.Utils
-         ( die, info, chattyTry, writeFileAtomic )
+         ( die', info, chattyTry, writeFileAtomic )
 import Distribution.Text
          ( Text(..), display, simpleParse )
 import qualified Distribution.Compat.ReadP as Parse
 import Distribution.Compat.Exception ( catchIO )
 import qualified Text.PrettyPrint as Disp
-import Text.PrettyPrint ( (<>), (<+>) )
 
 
 import Data.Char as Char
 
 import Data.List
-         ( unionBy, deleteFirstsBy, nubBy )
+         ( unionBy, deleteFirstsBy )
 import System.IO.Error
          ( isDoesNotExistError )
 import qualified Data.ByteString.Lazy.Char8 as B
-import Prelude hiding (getContents)
 
 
 data WorldPkgInfo = WorldPkgInfo Dependency FlagAssignment
@@ -91,7 +92,7 @@ modifyWorld :: ([WorldPkgInfo] -> [WorldPkgInfo]
 modifyWorld _ _         _     []   = return ()
 modifyWorld f verbosity world pkgs =
   chattyTry "Error while updating world-file. " $ do
-    pkgsOldWorld <- getContents world
+    pkgsOldWorld <- getContents verbosity world
     -- Filter out packages that are not in the world file:
     let pkgsNewWorld = nubBy equalUDep $ f pkgs pkgsOldWorld
     -- 'Dependency' is not an Ord instance, so we need to check for
@@ -107,12 +108,12 @@ modifyWorld f verbosity world pkgs =
 
 
 -- | Returns the content of the world file as a list
-getContents :: FilePath -> IO [WorldPkgInfo]
-getContents world = do
+getContents :: Verbosity -> FilePath -> IO [WorldPkgInfo]
+getContents verbosity world = do
   content <- safelyReadFile world
   let result = map simpleParse (lines $ B.unpack content)
   case sequence result of
-    Nothing -> die "Could not parse world file."
+    Nothing -> die' verbosity "Could not parse world file."
     Just xs -> return xs
   where
   safelyReadFile :: FilePath -> IO B.ByteString
@@ -123,21 +124,21 @@ getContents world = do
 
 
 instance Text WorldPkgInfo where
-  disp (WorldPkgInfo dep flags) = disp dep <+> dispFlags flags
+  disp (WorldPkgInfo dep flags) = disp dep Disp.<+> dispFlags (unFlagAssignment flags)
     where
       dispFlags [] = Disp.empty
       dispFlags fs = Disp.text "--flags="
-                  <> Disp.doubleQuotes (flagAssToDoc fs)
-      flagAssToDoc = foldr (\(FlagName fname,val) flagAssDoc ->
+                  <<>> Disp.doubleQuotes (flagAssToDoc fs)
+      flagAssToDoc = foldr (\(fname,val) flagAssDoc ->
                              (if not val then Disp.char '-'
                                          else Disp.empty)
-                             Disp.<> Disp.text fname
+                             <<>> Disp.text (unFlagName fname)
                              Disp.<+> flagAssDoc)
                            Disp.empty
   parse = do
       dep <- parse
       Parse.skipSpaces
-      flagAss <- Parse.option [] parseFlagAssignment
+      flagAss <- Parse.option mempty parseFlagAssignment
       return $ WorldPkgInfo dep flagAss
     where
       parseFlagAssignment :: Parse.ReadP r FlagAssignment
@@ -146,7 +147,7 @@ instance Text WorldPkgInfo where
           Parse.skipSpaces
           _ <- Parse.char '='
           Parse.skipSpaces
-          inDoubleQuotes $ Parse.many1 flag
+          mkFlagAssignment <$> (inDoubleQuotes $ Parse.many1 flag)
         where
           inDoubleQuotes :: Parse.ReadP r a -> Parse.ReadP r a
           inDoubleQuotes = Parse.between (Parse.char '"') (Parse.char '"')
@@ -156,7 +157,7 @@ instance Text WorldPkgInfo where
             val <- negative Parse.+++ positive
             name <- ident
             Parse.skipSpaces
-            return (FlagName name,val)
+            return (mkFlagName name,val)
           negative = do
             _ <- Parse.char '-'
             return False

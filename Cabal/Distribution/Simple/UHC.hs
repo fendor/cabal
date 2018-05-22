@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.UHC
@@ -16,15 +19,15 @@
 
 module Distribution.Simple.UHC (
     configure, getInstalledPackages,
-    buildLib, buildExe, installLib, registerPackage
+    buildLib, buildExe, installLib, registerPackage, inplacePackageDbPath
   ) where
 
-import Control.Monad
-import Data.List
-import qualified Data.Map as M ( empty )
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import Distribution.Compat.ReadP
 import Distribution.InstalledPackageInfo
-import Distribution.Package hiding (installedPackageId)
+import Distribution.Package hiding (installedUnitId)
 import Distribution.PackageDescription
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Compiler as C
@@ -33,24 +36,27 @@ import Distribution.Simple.PackageIndex
 import Distribution.Simple.Program
 import Distribution.Simple.Utils
 import Distribution.Text
+import Distribution.Types.MungedPackageId
 import Distribution.Verbosity
 import Distribution.Version
+import Distribution.System
 import Language.Haskell.Extension
+
+import qualified Data.Map as Map ( empty )
 import System.Directory
 import System.FilePath
-import Distribution.System ( Platform )
 
 -- -----------------------------------------------------------------------------
 -- Configuring
 
 configure :: Verbosity -> Maybe FilePath -> Maybe FilePath
-          -> ProgramConfiguration -> IO (Compiler, Maybe Platform, ProgramConfiguration)
-configure verbosity hcPath _hcPkgPath conf = do
+          -> ProgramDb -> IO (Compiler, Maybe Platform, ProgramDb)
+configure verbosity hcPath _hcPkgPath progdb = do
 
-  (_uhcProg, uhcVersion, conf') <-
+  (_uhcProg, uhcVersion, progdb') <-
     requireProgramVersion verbosity uhcProgram
-    (orLaterVersion (Version [1,0,2] []))
-    (userMaybeSpecifyPath "uhc" hcPath conf)
+    (orLaterVersion (mkVersion [1,0,2]))
+    (userMaybeSpecifyPath "uhc" hcPath progdb)
 
   let comp = Compiler {
                compilerId         =  CompilerId UHC uhcVersion,
@@ -58,22 +64,22 @@ configure verbosity hcPath _hcPkgPath conf = do
                compilerCompat     =  [],
                compilerLanguages  =  uhcLanguages,
                compilerExtensions =  uhcLanguageExtensions,
-               compilerProperties =  M.empty
+               compilerProperties =  Map.empty
              }
       compPlatform = Nothing
-  return (comp, compPlatform, conf')
+  return (comp, compPlatform, progdb')
 
 uhcLanguages :: [(Language, C.Flag)]
 uhcLanguages = [(Haskell98, "")]
 
 -- | The flags for the supported extensions.
-uhcLanguageExtensions :: [(Extension, C.Flag)]
+uhcLanguageExtensions :: [(Extension, Maybe C.Flag)]
 uhcLanguageExtensions =
     let doFlag (f, (enable, disable)) = [(EnableExtension  f, enable),
                                          (DisableExtension f, disable)]
-        alwaysOn = ("", ""{- wrong -})
+        alwaysOn = (Nothing, Nothing{- wrong -})
     in concatMap doFlag
-    [(CPP,                          ("--cpp", ""{- wrong -})),
+    [(CPP,                          (Just "--cpp", Nothing{- wrong -})),
      (PolymorphicComponents,        alwaysOn),
      (ExistentialQuantification,    alwaysOn),
      (ForeignFunctionInterface,     alwaysOn),
@@ -82,23 +88,22 @@ uhcLanguageExtensions =
      (Rank2Types,                   alwaysOn),
      (PatternSignatures,            alwaysOn),
      (EmptyDataDecls,               alwaysOn),
-     (ImplicitPrelude,              ("", "--no-prelude"{- wrong -})),
+     (ImplicitPrelude,              (Nothing, Just "--no-prelude"{- wrong -})),
      (TypeOperators,                alwaysOn),
      (OverlappingInstances,         alwaysOn),
      (FlexibleInstances,            alwaysOn)]
 
-getInstalledPackages :: Verbosity -> Compiler -> PackageDBStack -> ProgramConfiguration
+getInstalledPackages :: Verbosity -> Compiler -> PackageDBStack -> ProgramDb
                      -> IO InstalledPackageIndex
-getInstalledPackages verbosity comp packagedbs conf = do
+getInstalledPackages verbosity comp packagedbs progdb = do
   let compilerid = compilerId comp
-  systemPkgDir <- rawSystemProgramStdoutConf verbosity uhcProgram conf ["--meta-pkgdir-system"]
+  systemPkgDir <- getGlobalPackageDir verbosity progdb
   userPkgDir   <- getUserPackageDir
   let pkgDirs    = nub (concatMap (packageDbPaths userPkgDir systemPkgDir) packagedbs)
   -- putStrLn $ "pkgdirs: " ++ show pkgDirs
-  -- call to "lines" necessary, because pkgdir contains an extra newline at the end
-  pkgs <- liftM (map addBuiltinVersions . concat) .
-          mapM (\ d -> getDirectoryContents d >>= filterM (isPkgDir (display compilerid) d)) .
-          concatMap lines $ pkgDirs
+  pkgs <- liftM (map addBuiltinVersions . concat) $
+          traverse (\ d -> getDirectoryContents d >>= filterM (isPkgDir (display compilerid) d))
+          pkgDirs
   -- putStrLn $ "pkgs: " ++ show pkgs
   let iPkgs =
         map mkInstalledPackageInfo $
@@ -107,9 +112,16 @@ getInstalledPackages verbosity comp packagedbs conf = do
   -- putStrLn $ "installed pkgs: " ++ show iPkgs
   return (fromList iPkgs)
 
-getUserPackageDir :: IO FilePath
-getUserPackageDir =
-  do
+getGlobalPackageDir :: Verbosity -> ProgramDb -> IO FilePath
+getGlobalPackageDir verbosity progdb = do
+    output <- getDbProgramOutput verbosity
+                uhcProgram progdb ["--meta-pkgdir-system"]
+    -- call to "lines" necessary, because pkgdir contains an extra newline at the end
+    let [pkgdir] = lines output
+    return pkgdir
+
+getUserPackageDir :: NoCallStackIO FilePath
+getUserPackageDir = do
     homeDir <- getHomeDirectory
     return $ homeDir </> ".cabal" </> "lib"  -- TODO: determine in some other way
 
@@ -137,7 +149,7 @@ installedPkgConfig = "installed-pkg-config"
 -- | Check if a certain dir contains a valid package. Currently, we are
 -- looking only for the presence of an installed package configuration.
 -- TODO: Actually make use of the information provided in the file.
-isPkgDir :: String -> String -> String -> IO Bool
+isPkgDir :: String -> String -> String -> NoCallStackIO Bool
 isPkgDir _ _   ('.' : _)  = return False  -- ignore files starting with a .
 isPkgDir c dir xs         = do
                               let candidate = dir </> uhcPackageDir xs c
@@ -150,8 +162,8 @@ parsePackage x = map fst (filter (\ (_,y) -> null y) (readP_to_S parse x))
 -- | Create a trivial package info from a directory name.
 mkInstalledPackageInfo :: PackageId -> InstalledPackageInfo
 mkInstalledPackageInfo p = emptyInstalledPackageInfo
-  { installedPackageId = InstalledPackageId (display p),
-    sourcePackageId    = p }
+  { installedUnitId = mkLegacyUnitId p,
+    sourcePackageId = p }
 
 
 -- -----------------------------------------------------------------------------
@@ -161,9 +173,9 @@ buildLib :: Verbosity -> PackageDescription -> LocalBuildInfo
                       -> Library            -> ComponentLocalBuildInfo -> IO ()
 buildLib verbosity pkg_descr lbi lib clbi = do
 
-  systemPkgDir <- rawSystemProgramStdoutConf verbosity uhcProgram (withPrograms lbi) ["--meta-pkgdir-system"]
+  systemPkgDir <- getGlobalPackageDir verbosity (withPrograms lbi)
   userPkgDir   <- getUserPackageDir
-  let runUhcProg = rawSystemProgramConf verbosity uhcProgram (withPrograms lbi)
+  let runUhcProg = runDbProgram verbosity uhcProgram (withPrograms lbi)
   let uhcArgs =    -- set package name
                    ["--pkg-build=" ++ display (packageId pkg_descr)]
                    -- common flags lib/exe
@@ -174,24 +186,24 @@ buildLib verbosity pkg_descr lbi lib clbi = do
                    -- suboptimal: UHC does not understand module names, so
                    -- we replace periods by path separators
                 ++ map (map (\ c -> if c == '.' then pathSeparator else c))
-                       (map display (libModules lib))
+                       (map display (allLibModules lib clbi))
 
   runUhcProg uhcArgs
-  
+
   return ()
 
 buildExe :: Verbosity -> PackageDescription -> LocalBuildInfo
                       -> Executable         -> ComponentLocalBuildInfo -> IO ()
 buildExe verbosity _pkg_descr lbi exe clbi = do
-  systemPkgDir <- rawSystemProgramStdoutConf verbosity uhcProgram (withPrograms lbi) ["--meta-pkgdir-system"]
+  systemPkgDir <- getGlobalPackageDir verbosity (withPrograms lbi)
   userPkgDir   <- getUserPackageDir
-  let runUhcProg = rawSystemProgramConf verbosity uhcProgram (withPrograms lbi)
+  let runUhcProg = runDbProgram verbosity uhcProgram (withPrograms lbi)
   let uhcArgs =    -- common flags lib/exe
                    constructUHCCmdLine userPkgDir systemPkgDir
                                        lbi (buildInfo exe) clbi
                                        (buildDir lbi) verbosity
                    -- output file
-                ++ ["--output", buildDir lbi </> exeName exe]
+                ++ ["--output", buildDir lbi </> display (exeName exe)]
                    -- main source module
                 ++ [modulePath exe]
   runUhcProg uhcArgs
@@ -212,11 +224,12 @@ constructUHCCmdLine user system lbi bi clbi odir verbosity =
   ++ ["--hide-all-packages"]
   ++ uhcPackageDbOptions user system (withPackageDB lbi)
   ++ ["--package=uhcbase"]
-  ++ ["--package=" ++ display (pkgName pkgid) | (_, pkgid) <- componentPackageDeps clbi ]
+  ++ ["--package=" ++ display (mungedName pkgid) | (_, pkgid) <- componentPackageDeps clbi ]
      -- search paths
   ++ ["-i" ++ odir]
   ++ ["-i" ++ l | l <- nub (hsSourceDirs bi)]
-  ++ ["-i" ++ autogenModulesDir lbi]
+  ++ ["-i" ++ autogenComponentModulesDir lbi clbi]
+  ++ ["-i" ++ autogenPackageModulesDir lbi]
      -- cpp options
   ++ ["--optP=" ++ opt | opt <- cppOptions bi]
      -- output path
@@ -236,8 +249,8 @@ uhcPackageDbOptions user system db = map (\ x -> "--pkg-searchpath=" ++ x)
 
 installLib :: Verbosity -> LocalBuildInfo
            -> FilePath -> FilePath -> FilePath
-           -> PackageDescription -> Library -> IO ()
-installLib verbosity _lbi targetDir _dynlibTargetDir builtDir pkg _library = do
+           -> PackageDescription -> Library -> ComponentLocalBuildInfo -> IO ()
+installLib verbosity _lbi targetDir _dynlibTargetDir builtDir pkg _library _clbi = do
     -- putStrLn $ "dest:  " ++ targetDir
     -- putStrLn $ "built: " ++ builtDir
     installDirectoryContents verbosity (builtDir </> display (packageId pkg)) targetDir
@@ -258,19 +271,23 @@ uhcPackageSubDir       compilerid = compilerid </> uhcTarget </> uhcTargetVarian
 
 registerPackage
   :: Verbosity
-  -> InstalledPackageInfo
-  -> PackageDescription
-  -> LocalBuildInfo
-  -> Bool
+  -> Compiler
+  -> ProgramDb
   -> PackageDBStack
+  -> InstalledPackageInfo
   -> IO ()
-registerPackage verbosity installedPkgInfo pkg lbi inplace _packageDbs = do
-    let installDirs = absoluteInstallDirs pkg lbi NoCopyDest
-        pkgdir  | inplace   = buildDir lbi       </> uhcPackageDir    (display pkgid) (display compilerid)
-                | otherwise = libdir installDirs </> uhcPackageSubDir                 (display compilerid)
+registerPackage verbosity comp progdb packageDbs installedPkgInfo = do
+    dbdir <- case last packageDbs of
+      GlobalPackageDB       -> getGlobalPackageDir verbosity progdb
+      UserPackageDB         -> getUserPackageDir
+      SpecificPackageDB dir -> return dir
+    let pkgdir = dbdir </> uhcPackageDir (display pkgid) (display compilerid)
     createDirectoryIfMissingVerbose verbosity True pkgdir
     writeUTF8File (pkgdir </> installedPkgConfig)
                   (showInstalledPackageInfo installedPkgInfo)
   where
-    pkgid      = packageId pkg
-    compilerid = compilerId (compiler lbi)
+    pkgid      = sourcePackageId installedPkgInfo
+    compilerid = compilerId comp
+
+inplacePackageDbPath :: LocalBuildInfo -> FilePath
+inplacePackageDbPath lbi = buildDir lbi

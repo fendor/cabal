@@ -1,6 +1,8 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -24,6 +26,7 @@ module Distribution.Simple.InstallDirs (
         InstallDirs(..),
         InstallDirTemplates,
         defaultInstallDirs,
+        defaultInstallDirs',
         combineInstallDirs,
         absoluteInstallDirs,
         CopyDest(..),
@@ -35,6 +38,7 @@ module Distribution.Simple.InstallDirs (
         PathTemplateEnv,
         toPathTemplate,
         fromPathTemplate,
+        combinePathTemplate,
         substPathTemplate,
         initialPathTemplateEnv,
         platformTemplateEnv,
@@ -44,28 +48,22 @@ module Distribution.Simple.InstallDirs (
         installDirsTemplateEnv,
   ) where
 
-
-import Distribution.Compat.Binary (Binary)
-import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe)
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid (Monoid(..))
-#endif
-import GHC.Generics (Generic)
-import System.Directory (getAppUserDataDirectory)
-import System.FilePath ((</>), isPathSeparator, pathSeparator)
-import System.FilePath (dropDrive)
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.Package
-         ( PackageIdentifier, packageName, packageVersion, LibraryName )
 import Distribution.System
-         ( OS(..), buildOS, Platform(..) )
 import Distribution.Compiler
-         ( AbiTag(..), abiTagString, CompilerInfo(..), CompilerFlavor(..) )
 import Distribution.Text
-         ( display )
 
-#if mingw32_HOST_OS
+import System.Directory (getAppUserDataDirectory)
+import System.FilePath
+  ( (</>), isPathSeparator
+  , pathSeparator, dropDrive
+  , takeDirectory )
+
+#ifdef mingw32_HOST_OS
+import qualified Prelude
 import Foreign
 import Foreign.C
 #endif
@@ -87,7 +85,9 @@ data InstallDirs dir = InstallDirs {
         libdir       :: dir,
         libsubdir    :: dir,
         dynlibdir    :: dir,
+        flibdir      :: dir, -- ^ foreign libraries
         libexecdir   :: dir,
+        libexecsubdir:: dir,
         includedir   :: dir,
         datadir      :: dir,
         datasubdir   :: dir,
@@ -96,46 +96,16 @@ data InstallDirs dir = InstallDirs {
         htmldir      :: dir,
         haddockdir   :: dir,
         sysconfdir   :: dir
-    } deriving (Generic, Read, Show)
+    } deriving (Eq, Read, Show, Functor, Generic)
 
 instance Binary dir => Binary (InstallDirs dir)
 
-instance Functor InstallDirs where
-  fmap f dirs = InstallDirs {
-    prefix       = f (prefix dirs),
-    bindir       = f (bindir dirs),
-    libdir       = f (libdir dirs),
-    libsubdir    = f (libsubdir dirs),
-    dynlibdir    = f (dynlibdir dirs),
-    libexecdir   = f (libexecdir dirs),
-    includedir   = f (includedir dirs),
-    datadir      = f (datadir dirs),
-    datasubdir   = f (datasubdir dirs),
-    docdir       = f (docdir dirs),
-    mandir       = f (mandir dirs),
-    htmldir      = f (htmldir dirs),
-    haddockdir   = f (haddockdir dirs),
-    sysconfdir   = f (sysconfdir dirs)
-  }
+instance (Semigroup dir, Monoid dir) => Monoid (InstallDirs dir) where
+  mempty = gmempty
+  mappend = (<>)
 
-instance Monoid dir => Monoid (InstallDirs dir) where
-  mempty = InstallDirs {
-      prefix       = mempty,
-      bindir       = mempty,
-      libdir       = mempty,
-      libsubdir    = mempty,
-      dynlibdir    = mempty,
-      libexecdir   = mempty,
-      includedir   = mempty,
-      datadir      = mempty,
-      datasubdir   = mempty,
-      docdir       = mempty,
-      mandir       = mempty,
-      htmldir      = mempty,
-      haddockdir   = mempty,
-      sysconfdir   = mempty
-  }
-  mappend = combineInstallDirs mappend
+instance Semigroup dir => Semigroup (InstallDirs dir) where
+  (<>) = gmappend
 
 combineInstallDirs :: (a -> b -> c)
                    -> InstallDirs a
@@ -147,7 +117,9 @@ combineInstallDirs combine a b = InstallDirs {
     libdir       = libdir a     `combine` libdir b,
     libsubdir    = libsubdir a  `combine` libsubdir b,
     dynlibdir    = dynlibdir a  `combine` dynlibdir b,
+    flibdir      = flibdir a    `combine` flibdir b,
     libexecdir   = libexecdir a `combine` libexecdir b,
+    libexecsubdir= libexecsubdir a `combine` libexecsubdir b,
     includedir   = includedir a `combine` includedir b,
     datadir      = datadir a    `combine` datadir b,
     datasubdir   = datasubdir a `combine` datasubdir b,
@@ -161,8 +133,10 @@ combineInstallDirs combine a b = InstallDirs {
 appendSubdirs :: (a -> a -> a) -> InstallDirs a -> InstallDirs a
 appendSubdirs append dirs = dirs {
     libdir     = libdir dirs `append` libsubdir dirs,
+    libexecdir = libexecdir dirs `append` libexecsubdir dirs,
     datadir    = datadir dirs `append` datasubdir dirs,
     libsubdir  = error "internal error InstallDirs.libsubdir",
+    libexecsubdir = error "internal error InstallDirs.libexecsubdir",
     datasubdir = error "internal error InstallDirs.datasubdir"
   }
 
@@ -194,7 +168,17 @@ type InstallDirTemplates = InstallDirs PathTemplate
 -- Default installation directories
 
 defaultInstallDirs :: CompilerFlavor -> Bool -> Bool -> IO InstallDirTemplates
-defaultInstallDirs comp userInstall _hasLibs = do
+defaultInstallDirs = defaultInstallDirs' False
+
+defaultInstallDirs' :: Bool {- use external internal deps -}
+                    -> CompilerFlavor -> Bool -> Bool -> IO InstallDirTemplates
+defaultInstallDirs' True comp userInstall hasLibs = do
+  dflt <- defaultInstallDirs' False comp userInstall hasLibs
+  -- Be a bit more hermetic about per-component installs
+  return dflt { datasubdir = toPathTemplate $ "$abi" </> "$libname",
+                docdir     = toPathTemplate $ "$datadir" </> "doc" </> "$abi" </> "$libname"
+              }
+defaultInstallDirs' False comp userInstall _hasLibs = do
   installPrefix <-
       if userInstall
       then getAppUserDataDirectory "cabal"
@@ -217,7 +201,13 @@ defaultInstallDirs comp userInstall _hasLibs = do
            LHC    -> "$compiler"
            UHC    -> "$pkgid"
            _other -> "$abi" </> "$libname",
-      dynlibdir    = "$libdir",
+      dynlibdir    = "$libdir" </> case comp of
+           JHC    -> "$compiler"
+           LHC    -> "$compiler"
+           UHC    -> "$pkgid"
+           _other -> "$abi",
+      libexecsubdir= "$abi" </> "$pkgid",
+      flibdir      = "$libdir",
       libexecdir   = case buildOS of
         Windows   -> "$prefix" </> "$libname"
         _other    -> "$prefix" </> "libexec",
@@ -259,7 +249,9 @@ substituteInstallDirTemplates env dirs = dirs'
       libdir     = subst libdir     [prefixVar, bindirVar],
       libsubdir  = subst libsubdir  [],
       dynlibdir  = subst dynlibdir  [prefixVar, bindirVar, libdirVar],
+      flibdir    = subst flibdir    [prefixVar, bindirVar, libdirVar],
       libexecdir = subst libexecdir prefixBinLibVars,
+      libexecsubdir = subst libexecsubdir [],
       includedir = subst includedir prefixBinLibVars,
       datadir    = subst datadir    prefixBinLibVars,
       datasubdir = subst datasubdir [],
@@ -287,7 +279,7 @@ substituteInstallDirTemplates env dirs = dirs'
 -- substituting for all the variables in the abstract paths, to get real
 -- absolute path.
 absoluteInstallDirs :: PackageIdentifier
-                    -> LibraryName
+                    -> UnitId
                     -> CompilerInfo
                     -> CopyDest
                     -> Platform
@@ -296,19 +288,29 @@ absoluteInstallDirs :: PackageIdentifier
 absoluteInstallDirs pkgId libname compilerId copydest platform dirs =
     (case copydest of
        CopyTo destdir -> fmap ((destdir </>) . dropDrive)
+       CopyToDb dbdir -> fmap (substPrefix "${pkgroot}" (takeDirectory dbdir))
        _              -> id)
   . appendSubdirs (</>)
   . fmap fromPathTemplate
   $ substituteInstallDirTemplates env dirs
   where
     env = initialPathTemplateEnv pkgId libname compilerId platform
+    substPrefix pre root path
+      | pre `isPrefixOf` path = root ++ drop (length pre) path
+      | otherwise             = path
 
 
 -- |The location prefix for the /copy/ command.
 data CopyDest
   = NoCopyDest
   | CopyTo FilePath
-  deriving (Eq, Show)
+  | CopyToDb FilePath
+  -- ^ when using the ${pkgroot} as prefix. The CopyToDb will
+  --   adjust the paths to be relative to the provided package
+  --   database when copying / installing.
+  deriving (Eq, Show, Generic)
+
+instance Binary CopyDest
 
 -- | Check which of the paths are relative to the installation $prefix.
 --
@@ -317,7 +319,7 @@ data CopyDest
 -- independent\" package).
 --
 prefixRelativeInstallDirs :: PackageIdentifier
-                          -> LibraryName
+                          -> UnitId
                           -> CompilerInfo
                           -> Platform
                           -> InstallDirTemplates
@@ -349,7 +351,8 @@ prefixRelativeInstallDirs pkgId libname compilerId platform dirs =
 -- | An abstract path, possibly containing variables that need to be
 -- substituted for to get a real 'FilePath'.
 --
-newtype PathTemplate = PathTemplate [PathComponent] deriving (Eq, Generic, Ord)
+newtype PathTemplate = PathTemplate [PathComponent]
+  deriving (Eq, Ord, Generic)
 
 instance Binary PathTemplate
 
@@ -365,6 +368,7 @@ data PathTemplateVariable =
      | BindirVar     -- ^ The @$bindir@ path variable
      | LibdirVar     -- ^ The @$libdir@ path variable
      | LibsubdirVar  -- ^ The @$libsubdir@ path variable
+     | DynlibdirVar  -- ^ The @$dynlibdir@ path variable
      | DatadirVar    -- ^ The @$datadir@ path variable
      | DatasubdirVar -- ^ The @$datasubdir@ path variable
      | DocdirVar     -- ^ The @$docdir@ path variable
@@ -372,7 +376,7 @@ data PathTemplateVariable =
      | PkgNameVar    -- ^ The @$pkg@ package name path variable
      | PkgVerVar     -- ^ The @$version@ package version path variable
      | PkgIdVar      -- ^ The @$pkgid@ package Id path variable, eg @foo-1.0@
-     | LibNameVar    -- ^ The @$libname@ expanded package key path variable
+     | LibNameVar    -- ^ The @$libname@ path variable
      | CompilerVar   -- ^ The compiler name and version, eg @ghc-6.6.1@
      | OSVar         -- ^ The operating system name, eg @windows@ or @linux@
      | ArchVar       -- ^ The CPU architecture name, eg @i386@ or @x86_64@
@@ -392,7 +396,7 @@ type PathTemplateEnv = [(PathTemplateVariable, PathTemplate)]
 -- | Convert a 'FilePath' to a 'PathTemplate' including any template vars.
 --
 toPathTemplate :: FilePath -> PathTemplate
-toPathTemplate = PathTemplate . read
+toPathTemplate = PathTemplate . read -- TODO: eradicateNoParse
 
 -- | Convert back to a path, any remaining vars are included
 --
@@ -415,7 +419,7 @@ substPathTemplate environment (PathTemplate template) =
 
 -- | The initial environment has all the static stuff but no paths
 initialPathTemplateEnv :: PackageIdentifier
-                       -> LibraryName
+                       -> UnitId
                        -> CompilerInfo
                        -> Platform
                        -> PathTemplateEnv
@@ -425,11 +429,13 @@ initialPathTemplateEnv pkgId libname compiler platform =
   ++ platformTemplateEnv platform
   ++ abiTemplateEnv compiler platform
 
-packageTemplateEnv :: PackageIdentifier -> LibraryName -> PathTemplateEnv
-packageTemplateEnv pkgId libname =
+packageTemplateEnv :: PackageIdentifier -> UnitId -> PathTemplateEnv
+packageTemplateEnv pkgId uid =
   [(PkgNameVar,  PathTemplate [Ordinary $ display (packageName pkgId)])
   ,(PkgVerVar,   PathTemplate [Ordinary $ display (packageVersion pkgId)])
-  ,(LibNameVar,  PathTemplate [Ordinary $ display libname])
+  -- Invariant: uid is actually a HashedUnitId.  Hard to enforce because
+  -- it's an API change.
+  ,(LibNameVar,  PathTemplate [Ordinary $ display uid])
   ,(PkgIdVar,    PathTemplate [Ordinary $ display pkgId])
   ]
 
@@ -460,6 +466,7 @@ installDirsTemplateEnv dirs =
   ,(BindirVar,     bindir     dirs)
   ,(LibdirVar,     libdir     dirs)
   ,(LibsubdirVar,  libsubdir  dirs)
+  ,(DynlibdirVar,  dynlibdir  dirs)
   ,(DatadirVar,    datadir    dirs)
   ,(DatasubdirVar, datasubdir dirs)
   ,(DocdirVar,     docdir     dirs)
@@ -478,10 +485,11 @@ installDirsTemplateEnv dirs =
 
 instance Show PathTemplateVariable where
   show PrefixVar     = "prefix"
-  show LibNameVar     = "libname"
+  show LibNameVar    = "libname"
   show BindirVar     = "bindir"
   show LibdirVar     = "libdir"
   show LibsubdirVar  = "libsubdir"
+  show DynlibdirVar  = "dynlibdir"
   show DatadirVar    = "datadir"
   show DatasubdirVar = "datasubdir"
   show DocdirVar     = "docdir"
@@ -510,13 +518,14 @@ instance Read PathTemplateVariable where
                  ,("bindir",     BindirVar)
                  ,("libdir",     LibdirVar)
                  ,("libsubdir",  LibsubdirVar)
+                 ,("dynlibdir",  DynlibdirVar)
                  ,("datadir",    DatadirVar)
                  ,("datasubdir", DatasubdirVar)
                  ,("docdir",     DocdirVar)
                  ,("htmldir",    HtmldirVar)
                  ,("pkgid",      PkgIdVar)
-                 ,("pkgkey",     LibNameVar) -- backwards compatibility
                  ,("libname",    LibNameVar)
+                 ,("pkgkey",     LibNameVar) -- backwards compatibility
                  ,("pkg",        PkgNameVar)
                  ,("version",    PkgVerVar)
                  ,("compiler",   CompilerVar)
@@ -565,17 +574,17 @@ instance Read PathTemplate where
 -- ---------------------------------------------------------------------------
 -- Internal utilities
 
-getWindowsProgramFilesDir :: IO FilePath
+getWindowsProgramFilesDir :: NoCallStackIO FilePath
 getWindowsProgramFilesDir = do
-#if mingw32_HOST_OS
+#ifdef mingw32_HOST_OS
   m <- shGetFolderPath csidl_PROGRAM_FILES
 #else
   let m = Nothing
 #endif
   return (fromMaybe "C:\\Program Files" m)
 
-#if mingw32_HOST_OS
-shGetFolderPath :: CInt -> IO (Maybe FilePath)
+#ifdef mingw32_HOST_OS
+shGetFolderPath :: CInt -> NoCallStackIO (Maybe FilePath)
 shGetFolderPath n =
   allocaArray long_path_size $ \pPath -> do
      r <- c_SHGetFolderPath nullPtr n nullPtr 0 pPath
@@ -602,5 +611,5 @@ foreign import CALLCONV unsafe "shlobj.h SHGetFolderPathW"
                               -> Ptr ()
                               -> CInt
                               -> CWString
-                              -> IO CInt
+                              -> Prelude.IO CInt
 #endif

@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
-
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.InstalledPackageInfo
@@ -27,372 +25,126 @@
 -- This module is meant to be local-only to Distribution...
 
 module Distribution.InstalledPackageInfo (
-        InstalledPackageInfo_(..), InstalledPackageInfo,
-        libraryName,
-        OriginalModule(..), ExposedModule(..),
+        InstalledPackageInfo(..),
+        installedPackageId,
+        installedComponentId,
+        installedOpenUnitId,
+        sourceComponentName,
+        requiredSignatures,
+        ExposedModule(..),
+        AbiDependency(..),
         ParseResult(..), PError(..), PWarning,
         emptyInstalledPackageInfo,
         parseInstalledPackageInfo,
         showInstalledPackageInfo,
+        showFullInstalledPackageInfo,
         showInstalledPackageInfoField,
         showSimpleInstalledPackageInfoField,
-        fieldsInstalledPackageInfo,
   ) where
 
-import Distribution.ParseUtils
-         ( FieldDescr(..), ParseResult(..), PError(..), PWarning
-         , simpleField, listField, parseLicenseQ
-         , showFields, showSingleNamedField, showSimpleSingleNamedField
-         , parseFieldsFlat
-         , parseFilePathQ, parseTokenQ, parseModuleNameQ, parsePackageNameQ
-         , showFilePath, showToken, boolField, parseOptVersion
-         , parseFreeText, showFreeText, parseOptCommaList )
-import Distribution.License     ( License(..) )
-import Distribution.Package
-         ( PackageName(..), PackageIdentifier(..)
-         , PackageId, InstalledPackageId(..)
-         , packageName, packageVersion, PackageKey(..)
-         , LibraryName(..) )
-import qualified Distribution.Package as Package
+import Distribution.Compat.Prelude
+import Prelude ()
+
+import Data.Set                              (Set)
+import Distribution.Backpack
+import Distribution.CabalSpecVersion         (cabalSpecLatest)
+import Distribution.FieldGrammar
+import Distribution.FieldGrammar.FieldDescrs
 import Distribution.ModuleName
-         ( ModuleName )
-import Distribution.Version
-         ( Version(..) )
-import Distribution.Text
-         ( Text(disp, parse) )
-import Text.PrettyPrint as Disp
-import qualified Distribution.Compat.ReadP as Parse
+import Distribution.Package                  hiding (installedPackageId, installedUnitId)
+import Distribution.ParseUtils
+import Distribution.Types.ComponentName
+import Distribution.Utils.Generic            (toUTF8BS)
 
-import Distribution.Compat.Binary  (Binary)
-import Data.Maybe   (fromMaybe)
-import GHC.Generics (Generic)
+import qualified Data.Map                        as Map
+import qualified Distribution.Parsec.Common      as P
+import qualified Distribution.Parsec.Parser      as P
+import qualified Distribution.Parsec.ParseResult as P
+import qualified Text.Parsec.Error               as Parsec
+import qualified Text.Parsec.Pos                 as Parsec
+import qualified Text.PrettyPrint                as Disp
 
--- -----------------------------------------------------------------------------
--- The InstalledPackageInfo type
+import Distribution.Types.InstalledPackageInfo
+import Distribution.Types.InstalledPackageInfo.FieldGrammar
 
 
-data InstalledPackageInfo_ m
-   = InstalledPackageInfo {
-        -- these parts are exactly the same as PackageDescription
-        installedPackageId :: InstalledPackageId,
-        sourcePackageId    :: PackageId,
-        packageKey         :: PackageKey,
-        license           :: License,
-        copyright         :: String,
-        maintainer        :: String,
-        author            :: String,
-        stability         :: String,
-        homepage          :: String,
-        pkgUrl            :: String,
-        synopsis          :: String,
-        description       :: String,
-        category          :: String,
-        -- these parts are required by an installed package only:
-        exposed           :: Bool,
-        exposedModules    :: [ExposedModule],
-        instantiatedWith  :: [(m, OriginalModule)],
-        hiddenModules     :: [m],
-        trusted           :: Bool,
-        importDirs        :: [FilePath],
-        libraryDirs       :: [FilePath],
-        dataDir           :: FilePath,
-        hsLibraries       :: [String],
-        extraLibraries    :: [String],
-        extraGHCiLibraries:: [String],    -- overrides extraLibraries for GHCi
-        includeDirs       :: [FilePath],
-        includes          :: [String],
-        depends           :: [InstalledPackageId],
-        ccOptions         :: [String],
-        ldOptions         :: [String],
-        frameworkDirs     :: [FilePath],
-        frameworks        :: [String],
-        haddockInterfaces :: [FilePath],
-        haddockHTMLs      :: [FilePath],
-        pkgRoot           :: Maybe FilePath
-    }
-    deriving (Generic, Read, Show)
 
-libraryName :: InstalledPackageInfo_ a -> LibraryName
-libraryName ipi = Package.packageKeyLibraryName (sourcePackageId ipi) (packageKey ipi)
+installedComponentId :: InstalledPackageInfo -> ComponentId
+installedComponentId ipi =
+    case unComponentId (installedComponentId_ ipi) of
+        "" -> mkComponentId (unUnitId (installedUnitId ipi))
+        _  -> installedComponentId_ ipi
 
-instance Binary m => Binary (InstalledPackageInfo_ m)
+-- | Get the indefinite unit identity representing this package.
+-- This IS NOT guaranteed to give you a substitution; for
+-- instantiated packages you will get @DefiniteUnitId (installedUnitId ipi)@.
+-- For indefinite libraries, however, you will correctly get
+-- an @OpenUnitId@ with the appropriate 'OpenModuleSubst'.
+installedOpenUnitId :: InstalledPackageInfo -> OpenUnitId
+installedOpenUnitId ipi
+    = mkOpenUnitId (installedUnitId ipi) (installedComponentId ipi) (Map.fromList (instantiatedWith ipi))
 
-instance Package.Package (InstalledPackageInfo_ str) where
-   packageId = sourcePackageId
+-- | Returns the set of module names which need to be filled for
+-- an indefinite package, or the empty set if the package is definite.
+requiredSignatures :: InstalledPackageInfo -> Set ModuleName
+requiredSignatures ipi = openModuleSubstFreeHoles (Map.fromList (instantiatedWith ipi))
 
-instance Package.HasInstalledPackageId (InstalledPackageInfo_ str) where
-   installedPackageId = installedPackageId
-
-instance Package.PackageInstalled (InstalledPackageInfo_ str) where
-   installedDepends = depends
-
-type InstalledPackageInfo = InstalledPackageInfo_ ModuleName
-
-emptyInstalledPackageInfo :: InstalledPackageInfo_ m
-emptyInstalledPackageInfo
-   = InstalledPackageInfo {
-        installedPackageId = InstalledPackageId "",
-        sourcePackageId    = PackageIdentifier (PackageName "") noVersion,
-        packageKey         = OldPackageKey (PackageIdentifier
-                                               (PackageName "") noVersion),
-        license           = UnspecifiedLicense,
-        copyright         = "",
-        maintainer        = "",
-        author            = "",
-        stability         = "",
-        homepage          = "",
-        pkgUrl            = "",
-        synopsis          = "",
-        description       = "",
-        category          = "",
-        exposed           = False,
-        exposedModules    = [],
-        hiddenModules     = [],
-        instantiatedWith  = [],
-        trusted           = False,
-        importDirs        = [],
-        libraryDirs       = [],
-        dataDir           = "",
-        hsLibraries       = [],
-        extraLibraries    = [],
-        extraGHCiLibraries= [],
-        includeDirs       = [],
-        includes          = [],
-        depends           = [],
-        ccOptions         = [],
-        ldOptions         = [],
-        frameworkDirs     = [],
-        frameworks        = [],
-        haddockInterfaces = [],
-        haddockHTMLs      = [],
-        pkgRoot           = Nothing
-    }
-
-noVersion :: Version
-noVersion = Version [] []
+{-# DEPRECATED installedPackageId "Use installedUnitId instead" #-}
+-- | Backwards compatibility with Cabal pre-1.24.
+--
+-- This type synonym is slightly awful because in cabal-install
+-- we define an 'InstalledPackageId' but it's a ComponentId,
+-- not a UnitId!
+installedPackageId :: InstalledPackageInfo -> UnitId
+installedPackageId = installedUnitId
 
 -- -----------------------------------------------------------------------------
--- Exposed modules
+-- Munging
 
-data OriginalModule
-   = OriginalModule {
-       originalPackageId :: InstalledPackageId,
-       originalModuleName :: ModuleName
-     }
-  deriving (Generic, Eq, Read, Show)
-
-data ExposedModule
-   = ExposedModule {
-       exposedName      :: ModuleName,
-       exposedReexport  :: Maybe OriginalModule,
-       exposedSignature :: Maybe OriginalModule -- This field is unused for now.
-     }
-  deriving (Generic, Read, Show)
-
-instance Text OriginalModule where
-    disp (OriginalModule ipi m) =
-        disp ipi <> Disp.char ':' <> disp m
-    parse = do
-        ipi <- parse
-        _ <- Parse.char ':'
-        m <- parse
-        return (OriginalModule ipi m)
-
-instance Text ExposedModule where
-    disp (ExposedModule m reexport signature) =
-        Disp.sep [ disp m
-                 , case reexport of
-                    Just m' -> Disp.sep [Disp.text "from", disp m']
-                    Nothing -> Disp.empty
-                 , case signature of
-                    Just m' -> Disp.sep [Disp.text "is", disp m']
-                    Nothing -> Disp.empty
-                 ]
-    parse = do
-        m <- parseModuleNameQ
-        Parse.skipSpaces
-        reexport <- Parse.option Nothing $ do
-            _ <- Parse.string "from"
-            Parse.skipSpaces
-            fmap Just parse
-        Parse.skipSpaces
-        signature <- Parse.option Nothing $ do
-            _ <- Parse.string "is"
-            Parse.skipSpaces
-            fmap Just parse
-        return (ExposedModule m reexport signature)
-
-
-instance Binary OriginalModule
-
-instance Binary ExposedModule
-
--- To maintain backwards-compatibility, we accept both comma/non-comma
--- separated variants of this field.  You SHOULD use the comma syntax if you
--- use any new functions, although actually it's unambiguous due to a quirk
--- of the fact that modules must start with capital letters.
-
-showExposedModules :: [ExposedModule] -> Disp.Doc
-showExposedModules xs
-    | all isExposedModule xs = fsep (map disp xs)
-    | otherwise = fsep (Disp.punctuate comma (map disp xs))
-    where isExposedModule (ExposedModule _ Nothing Nothing) = True
-          isExposedModule _ = False
-
-parseExposedModules :: Parse.ReadP r [ExposedModule]
-parseExposedModules = parseOptCommaList parse
+sourceComponentName :: InstalledPackageInfo -> ComponentName
+sourceComponentName ipi =
+    case sourceLibName ipi of
+        Nothing -> CLibName
+        Just qn -> CSubLibName qn
 
 -- -----------------------------------------------------------------------------
 -- Parsing
 
 parseInstalledPackageInfo :: String -> ParseResult InstalledPackageInfo
-parseInstalledPackageInfo =
-    parseFieldsFlat (fieldsInstalledPackageInfo ++ deprecatedFieldDescrs)
-    emptyInstalledPackageInfo
-
-parseInstantiatedWith :: Parse.ReadP r (ModuleName, OriginalModule)
-parseInstantiatedWith = do k <- parse
-                           _ <- Parse.char '='
-                           n <- parse
-                           _ <- Parse.char '@'
-                           p <- parse
-                           return (k, OriginalModule p n)
+parseInstalledPackageInfo s = case P.readFields (toUTF8BS s) of
+    Left err -> ParseFailed (NoParse (show err) $ Parsec.sourceLine $ Parsec.errorPos err)
+    Right fs -> case partitionFields fs of
+        (fs', _) -> case P.runParseResult $ parseFieldGrammar cabalSpecLatest fs' ipiFieldGrammar of
+            (ws, Right x) -> ParseOk ws' x where
+                ws' = map (PWarning . P.showPWarning "") ws
+            (_,  Left (_, errs)) -> ParseFailed (NoParse errs' 0) where
+                errs' = intercalate "; " $ map (\(P.PError _ msg) -> msg) errs
 
 -- -----------------------------------------------------------------------------
 -- Pretty-printing
 
+-- | Pretty print 'InstalledPackageInfo'.
+--
+-- @pkgRoot@ isn't printed, as ghc-pkg prints it manually (as GHC-8.4).
 showInstalledPackageInfo :: InstalledPackageInfo -> String
-showInstalledPackageInfo = showFields fieldsInstalledPackageInfo
+showInstalledPackageInfo ipi =
+    showFullInstalledPackageInfo ipi { pkgRoot = Nothing }
 
+-- | The variant of 'showInstalledPackageInfo' which outputs @pkgroot@ field too.
+showFullInstalledPackageInfo :: InstalledPackageInfo -> String
+showFullInstalledPackageInfo = Disp.render . (Disp.$+$ Disp.text "") . prettyFieldGrammar ipiFieldGrammar
+
+-- |
+--
+-- >>> let ipi = emptyInstalledPackageInfo { maintainer = "Tester" }
+-- >>> fmap ($ ipi) $ showInstalledPackageInfoField "maintainer"
+-- Just "maintainer: Tester"
 showInstalledPackageInfoField :: String -> Maybe (InstalledPackageInfo -> String)
-showInstalledPackageInfoField = showSingleNamedField fieldsInstalledPackageInfo
+showInstalledPackageInfoField fn =
+    fmap (\g -> Disp.render . ppField fn . g) $ fieldDescrPretty ipiFieldGrammar fn
 
 showSimpleInstalledPackageInfoField :: String -> Maybe (InstalledPackageInfo -> String)
-showSimpleInstalledPackageInfoField = showSimpleSingleNamedField fieldsInstalledPackageInfo
-
-showInstantiatedWith :: (ModuleName, OriginalModule) -> Doc
-showInstantiatedWith (k, OriginalModule p m) = disp k <> text "=" <> disp m <> text "@" <> disp p
-
--- -----------------------------------------------------------------------------
--- Description of the fields, for parsing/printing
-
-fieldsInstalledPackageInfo :: [FieldDescr InstalledPackageInfo]
-fieldsInstalledPackageInfo = basicFieldDescrs ++ installedFieldDescrs
-
-basicFieldDescrs :: [FieldDescr InstalledPackageInfo]
-basicFieldDescrs =
- [ simpleField "name"
-                           disp                   parsePackageNameQ
-                           packageName            (\name pkg -> pkg{sourcePackageId=(sourcePackageId pkg){pkgName=name}})
- , simpleField "version"
-                           disp                   parseOptVersion
-                           packageVersion         (\ver pkg -> pkg{sourcePackageId=(sourcePackageId pkg){pkgVersion=ver}})
- , simpleField "id"
-                           disp                   parse
-                           installedPackageId     (\ipid pkg -> pkg{installedPackageId=ipid})
- , simpleField "key"
-                           disp                   parse
-                           packageKey             (\pk pkg -> pkg{packageKey=pk})
- , simpleField "license"
-                           disp                   parseLicenseQ
-                           license                (\l pkg -> pkg{license=l})
- , simpleField "copyright"
-                           showFreeText           parseFreeText
-                           copyright              (\val pkg -> pkg{copyright=val})
- , simpleField "maintainer"
-                           showFreeText           parseFreeText
-                           maintainer             (\val pkg -> pkg{maintainer=val})
- , simpleField "stability"
-                           showFreeText           parseFreeText
-                           stability              (\val pkg -> pkg{stability=val})
- , simpleField "homepage"
-                           showFreeText           parseFreeText
-                           homepage               (\val pkg -> pkg{homepage=val})
- , simpleField "package-url"
-                           showFreeText           parseFreeText
-                           pkgUrl                 (\val pkg -> pkg{pkgUrl=val})
- , simpleField "synopsis"
-                           showFreeText           parseFreeText
-                           synopsis               (\val pkg -> pkg{synopsis=val})
- , simpleField "description"
-                           showFreeText           parseFreeText
-                           description            (\val pkg -> pkg{description=val})
- , simpleField "category"
-                           showFreeText           parseFreeText
-                           category               (\val pkg -> pkg{category=val})
- , simpleField "author"
-                           showFreeText           parseFreeText
-                           author                 (\val pkg -> pkg{author=val})
- ]
-
-installedFieldDescrs :: [FieldDescr InstalledPackageInfo]
-installedFieldDescrs = [
-   boolField "exposed"
-        exposed            (\val pkg -> pkg{exposed=val})
- , simpleField "exposed-modules"
-        showExposedModules parseExposedModules
-        exposedModules     (\xs    pkg -> pkg{exposedModules=xs})
- , listField   "hidden-modules"
-        disp               parseModuleNameQ
-        hiddenModules      (\xs    pkg -> pkg{hiddenModules=xs})
- , listField   "instantiated-with"
-        showInstantiatedWith parseInstantiatedWith
-        instantiatedWith   (\xs    pkg -> pkg{instantiatedWith=xs})
- , boolField   "trusted"
-        trusted            (\val pkg -> pkg{trusted=val})
- , listField   "import-dirs"
-        showFilePath       parseFilePathQ
-        importDirs         (\xs pkg -> pkg{importDirs=xs})
- , listField   "library-dirs"
-        showFilePath       parseFilePathQ
-        libraryDirs        (\xs pkg -> pkg{libraryDirs=xs})
- , simpleField "data-dir"
-        showFilePath       (parseFilePathQ Parse.<++ return "")
-        dataDir            (\val pkg -> pkg{dataDir=val})
- , listField   "hs-libraries"
-        showFilePath       parseTokenQ
-        hsLibraries        (\xs pkg -> pkg{hsLibraries=xs})
- , listField   "extra-libraries"
-        showToken          parseTokenQ
-        extraLibraries     (\xs pkg -> pkg{extraLibraries=xs})
- , listField   "extra-ghci-libraries"
-        showToken          parseTokenQ
-        extraGHCiLibraries (\xs pkg -> pkg{extraGHCiLibraries=xs})
- , listField   "include-dirs"
-        showFilePath       parseFilePathQ
-        includeDirs        (\xs pkg -> pkg{includeDirs=xs})
- , listField   "includes"
-        showFilePath       parseFilePathQ
-        includes           (\xs pkg -> pkg{includes=xs})
- , listField   "depends"
-        disp               parse
-        depends            (\xs pkg -> pkg{depends=xs})
- , listField   "cc-options"
-        showToken          parseTokenQ
-        ccOptions          (\path  pkg -> pkg{ccOptions=path})
- , listField   "ld-options"
-        showToken          parseTokenQ
-        ldOptions          (\path  pkg -> pkg{ldOptions=path})
- , listField   "framework-dirs"
-        showFilePath       parseFilePathQ
-        frameworkDirs      (\xs pkg -> pkg{frameworkDirs=xs})
- , listField   "frameworks"
-        showToken          parseTokenQ
-        frameworks         (\xs pkg -> pkg{frameworks=xs})
- , listField   "haddock-interfaces"
-        showFilePath       parseFilePathQ
-        haddockInterfaces  (\xs pkg -> pkg{haddockInterfaces=xs})
- , listField   "haddock-html"
-        showFilePath       parseFilePathQ
-        haddockHTMLs       (\xs pkg -> pkg{haddockHTMLs=xs})
- , simpleField "pkgroot"
-        (const Disp.empty)        parseFilePathQ
-        (fromMaybe "" . pkgRoot)  (\xs pkg -> pkg{pkgRoot=Just xs})
- ]
-
-deprecatedFieldDescrs :: [FieldDescr InstalledPackageInfo]
-deprecatedFieldDescrs = [
-   listField   "hugs-options"
-        showToken          parseTokenQ
-        (const [])        (const id)
-  ]
+showSimpleInstalledPackageInfoField fn =
+    fmap (Disp.renderStyle myStyle .) $ fieldDescrPretty ipiFieldGrammar fn
+  where
+    myStyle = Disp.style { Disp.mode = Disp.LeftMode }

@@ -18,42 +18,44 @@ module Distribution.Simple.Build.PathsModule (
     generate, pkgPathEnvVar
   ) where
 
-import Distribution.System
-         ( OS(Windows), buildOS, Arch(..), buildArch )
-import Distribution.Simple.Compiler
-         ( CompilerFlavor(..), compilerFlavor, compilerVersion )
-import Distribution.Package
-         ( packageId, packageName, packageVersion )
-import Distribution.PackageDescription
-         ( PackageDescription(..), hasLibs )
-import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(..), InstallDirs(..)
-         , absoluteInstallDirs, prefixRelativeInstallDirs )
-import Distribution.Simple.Setup ( CopyDest(NoCopyDest) )
-import Distribution.Simple.BuildPaths
-         ( autogenModuleName )
-import Distribution.Simple.Utils
-         ( shortRelativePath )
-import Distribution.Text
-         ( display )
-import Distribution.Version
-         ( Version(..), orLaterVersion, withinRange )
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import System.FilePath
-         ( pathSeparator )
-import Data.Maybe
-         ( fromJust, isNothing )
+import Distribution.System
+import Distribution.Simple.Compiler
+import Distribution.Package
+import Distribution.PackageDescription
+import Distribution.Simple.LocalBuildInfo
+import Distribution.Simple.BuildPaths
+import Distribution.Simple.Utils
+import Distribution.Text
+import Distribution.Version
+
+import System.FilePath ( pathSeparator )
 
 -- ------------------------------------------------------------
 -- * Building Paths_<pkg>.hs
 -- ------------------------------------------------------------
 
-generate :: PackageDescription -> LocalBuildInfo -> String
-generate pkg_descr lbi =
-   let pragmas = cpp_pragma ++ ffi_pragmas ++ warning_pragmas
+generate :: PackageDescription -> LocalBuildInfo -> ComponentLocalBuildInfo -> String
+generate pkg_descr lbi clbi =
+   let pragmas =
+            cpp_pragma
+         ++ no_rebindable_syntax_pragma
+         ++ ffi_pragmas
+         ++ warning_pragmas
 
-       cpp_pragma | supports_cpp = "{-# LANGUAGE CPP #-}"
-                  | otherwise    = ""
+       cpp_pragma
+         | supports_cpp = "{-# LANGUAGE CPP #-}\n"
+         | otherwise    = ""
+
+       -- -XRebindableSyntax is problematic because when paired with
+       -- -XOverloadedLists, 'fromListN' is not in scope,
+       -- or -XOverloadedStrings 'fromString' is not in scope,
+       -- so we disable 'RebindableSyntax'.
+       no_rebindable_syntax_pragma
+         | supports_rebindable_syntax = "{-# LANGUAGE NoRebindableSyntax #-}\n"
+         | otherwise                  = ""
 
        ffi_pragmas
         | absolute = ""
@@ -81,7 +83,7 @@ generate pkg_descr lbi =
         pragmas++
         "module " ++ display paths_modulename ++ " (\n"++
         "    version,\n"++
-        "    getBinDir, getLibDir, getDataDir, getLibexecDir,\n"++
+        "    getBinDir, getLibDir, getDynLibDir, getDataDir, getLibexecDir,\n"++
         "    getDataFileName, getSysconfDir\n"++
         "  ) where\n"++
         "\n"++
@@ -110,17 +112,18 @@ generate pkg_descr lbi =
         "catchIO = Exception.catch\n" ++
         "\n"++
         "version :: Version"++
-        "\nversion = Version " ++ show branch ++ " " ++ show tags
-          where Version branch tags = packageVersion pkg_descr
+        "\nversion = Version " ++ show branch ++ " []"
+          where branch = versionNumbers $ packageVersion pkg_descr
 
        body
         | reloc =
           "\n\nbindirrel :: FilePath\n" ++
           "bindirrel = " ++ show flat_bindirreloc ++
           "\n"++
-          "\ngetBinDir, getLibDir, getDataDir, getLibexecDir, getSysconfDir :: IO FilePath\n"++
+          "\ngetBinDir, getLibDir, getDynLibDir, getDataDir, getLibexecDir, getSysconfDir :: IO FilePath\n"++
           "getBinDir = "++mkGetEnvOrReloc "bindir" flat_bindirreloc++"\n"++
           "getLibDir = "++mkGetEnvOrReloc "libdir" flat_libdirreloc++"\n"++
+          "getDynLibDir = "++mkGetEnvOrReloc "libdir" flat_dynlibdirreloc++"\n"++
           "getDataDir = "++mkGetEnvOrReloc "datadir" flat_datadirreloc++"\n"++
           "getLibexecDir = "++mkGetEnvOrReloc "libexecdir" flat_libexecdirreloc++"\n"++
           "getSysconfDir = "++mkGetEnvOrReloc "sysconfdir" flat_sysconfdirreloc++"\n"++
@@ -134,16 +137,18 @@ generate pkg_descr lbi =
           "\n"++
           filename_stuff
         | absolute =
-          "\nbindir, libdir, datadir, libexecdir, sysconfdir :: FilePath\n"++
+          "\nbindir, libdir, dynlibdir, datadir, libexecdir, sysconfdir :: FilePath\n"++
           "\nbindir     = " ++ show flat_bindir ++
           "\nlibdir     = " ++ show flat_libdir ++
+          "\ndynlibdir  = " ++ show flat_dynlibdir ++
           "\ndatadir    = " ++ show flat_datadir ++
           "\nlibexecdir = " ++ show flat_libexecdir ++
           "\nsysconfdir = " ++ show flat_sysconfdir ++
           "\n"++
-          "\ngetBinDir, getLibDir, getDataDir, getLibexecDir, getSysconfDir :: IO FilePath\n"++
+          "\ngetBinDir, getLibDir, getDynLibDir, getDataDir, getLibexecDir, getSysconfDir :: IO FilePath\n"++
           "getBinDir = "++mkGetEnvOr "bindir" "return bindir"++"\n"++
           "getLibDir = "++mkGetEnvOr "libdir" "return libdir"++"\n"++
+          "getDynLibDir = "++mkGetEnvOr "dynlibdir" "return dynlibdir"++"\n"++
           "getDataDir = "++mkGetEnvOr "datadir" "return datadir"++"\n"++
           "getLibexecDir = "++mkGetEnvOr "libexecdir" "return libexecdir"++"\n"++
           "getSysconfDir = "++mkGetEnvOr "sysconfdir" "return sysconfdir"++"\n"++
@@ -155,12 +160,14 @@ generate pkg_descr lbi =
         | otherwise =
           "\nprefix, bindirrel :: FilePath" ++
           "\nprefix        = " ++ show flat_prefix ++
-          "\nbindirrel     = " ++ show (fromJust flat_bindirrel) ++
+          "\nbindirrel     = " ++ show (fromMaybe (error "PathsModule.generate") flat_bindirrel) ++
           "\n\n"++
           "getBinDir :: IO FilePath\n"++
           "getBinDir = getPrefixDirRel bindirrel\n\n"++
           "getLibDir :: IO FilePath\n"++
           "getLibDir = "++mkGetDir flat_libdir flat_libdirrel++"\n\n"++
+          "getDynLibDir :: IO FilePath\n"++
+          "getDynLibDir = "++mkGetDir flat_dynlibdir flat_dynlibdirrel++"\n\n"++
           "getDataDir :: IO FilePath\n"++
           "getDataDir =  "++ mkGetEnvOr "datadir"
                               (mkGetDir flat_datadir flat_datadirrel)++"\n\n"++
@@ -179,24 +186,29 @@ generate pkg_descr lbi =
    in header++body
 
  where
+        cid = componentUnitId clbi
+
         InstallDirs {
           prefix     = flat_prefix,
           bindir     = flat_bindir,
           libdir     = flat_libdir,
+          dynlibdir  = flat_dynlibdir,
           datadir    = flat_datadir,
           libexecdir = flat_libexecdir,
           sysconfdir = flat_sysconfdir
-        } = absoluteInstallDirs pkg_descr lbi NoCopyDest
+        } = absoluteComponentInstallDirs pkg_descr lbi cid NoCopyDest
         InstallDirs {
           bindir     = flat_bindirrel,
           libdir     = flat_libdirrel,
+          dynlibdir  = flat_dynlibdirrel,
           datadir    = flat_datadirrel,
           libexecdir = flat_libexecdirrel,
           sysconfdir = flat_sysconfdirrel
-        } = prefixRelativeInstallDirs (packageId pkg_descr) lbi
+        } = prefixRelativeComponentInstallDirs (packageId pkg_descr) lbi cid
 
         flat_bindirreloc = shortRelativePath flat_prefix flat_bindir
         flat_libdirreloc = shortRelativePath flat_prefix flat_libdir
+        flat_dynlibdirreloc = shortRelativePath flat_prefix flat_dynlibdir
         flat_datadirreloc = shortRelativePath flat_prefix flat_datadir
         flat_libexecdirreloc = shortRelativePath flat_prefix flat_libexecdir
         flat_sysconfdirreloc = shortRelativePath flat_prefix flat_sysconfdir
@@ -229,22 +241,26 @@ generate pkg_descr lbi =
                            _         -> False
         supportsRelocatableProgs _    = False
 
-        paths_modulename = autogenModuleName pkg_descr
+        paths_modulename = autogenPathsModuleName pkg_descr
 
         get_prefix_stuff = get_prefix_win32 buildArch
 
         path_sep = show [pathSeparator]
 
-        supports_cpp = compilerFlavor (compiler lbi) == GHC
+        supports_cpp = supports_language_pragma
+        supports_rebindable_syntax= ghc_newer_than (mkVersion [7,0,1])
+        supports_language_pragma = ghc_newer_than (mkVersion [6,6,1])
 
-        supports_language_pragma =
-          (compilerFlavor (compiler lbi) == GHC &&
-            (compilerVersion (compiler lbi)
-              `withinRange` orLaterVersion (Version [6,6,1] []))) ||
-           compilerFlavor (compiler lbi) == GHCJS
+        ghc_newer_than minVersion =
+          case compilerCompatVersion GHC (compiler lbi) of
+            Nothing -> False
+            Just version -> version `withinRange` orLaterVersion minVersion
 
 -- | Generates the name of the environment variable controlling the path
 -- component of interest.
+--
+-- Note: The format of these strings is part of Cabal's public API;
+-- changing this function constitutes a *backwards-compatibility* break.
 pkgPathEnvVar :: PackageDescription
               -> String     -- ^ path component; one of \"bindir\", \"libdir\",
                             -- \"datadir\", \"libexecdir\", or \"sysconfdir\"

@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Init.Heuristics
@@ -20,32 +19,31 @@ module Distribution.Client.Init.Heuristics (
     guessAuthorNameMail,
     knownCategories,
 ) where
+
+import Prelude ()
+import Distribution.Client.Compat.Prelude
+
 import Distribution.Text         (simpleParse)
 import Distribution.Simple.Setup (Flag(..), flagToMaybe)
 import Distribution.ModuleName
     ( ModuleName, toFilePath )
-import Distribution.Client.PackageIndex
-    ( allPackagesByName )
 import qualified Distribution.Package as P
 import qualified Distribution.PackageDescription as PD
     ( category, packageDescription )
-import Distribution.Simple.Utils
-         ( intercalate )
 import Distribution.Client.Utils
          ( tryCanonicalizePath )
 import Language.Haskell.Extension ( Extension )
 
-import Distribution.Client.Types ( packageDescription, SourcePackageDb(..) )
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative ( pure, (<$>), (<*>) )
-import Data.Monoid         ( mempty, mappend, mconcat )
-#endif
-import Control.Arrow ( first )
-import Control.Monad ( liftM )
-import Data.Char   ( isAlphaNum, isNumber, isUpper, isLower, isSpace )
+import Distribution.Solver.Types.PackageIndex
+    ( allPackagesByName )
+import Distribution.Solver.Types.SourcePackage
+    ( packageDescription )
+
+import Distribution.Client.Types ( SourcePackageDb(..) )
+import Control.Monad ( mapM )
+import Data.Char   ( isNumber, isLower )
 import Data.Either ( partitionEithers )
-import Data.List   ( isInfixOf, isPrefixOf, isSuffixOf, sortBy )
-import Data.Maybe  ( mapMaybe, catMaybes, maybeToList )
+import Data.List   ( isInfixOf )
 import Data.Ord    ( comparing )
 import qualified Data.Set as Set ( fromList, toList )
 import System.Directory ( getCurrentDirectory, getDirectoryContents,
@@ -88,7 +86,7 @@ guessMainFileCandidates flags = do
 
 -- | Guess the package name based on the given root directory.
 guessPackageName :: FilePath -> IO P.PackageName
-guessPackageName = liftM (P.PackageName . repair . last . splitDirectories)
+guessPackageName = liftM (P.mkPackageName . repair . last . splitDirectories)
                  . tryCanonicalizePath
   where
     -- Treat each span of non-alphanumeric characters as a hyphen. Each
@@ -175,7 +173,7 @@ findImportsAndExts projectRoot sf = do
               . lines
               $ s
 
-      -- XXX we should probably make a better attempt at parsing
+      -- TODO: We should probably make a better attempt at parsing
       -- comments above.  Unfortunately we can't use a full-fledged
       -- Haskell parser since cabal's dependencies must be kept at a
       -- minimum.
@@ -251,7 +249,11 @@ guessAuthorNameMail = fmap authorGuessPure authorGuessIO
 -- Ordered in increasing preference, since Flag-as-monoid is identical to
 -- Last.
 authorGuessPure :: AuthorGuessIO -> AuthorGuess
-authorGuessPure (AuthorGuessIO env darcsLocalF darcsGlobalF gitLocal gitGlobal)
+authorGuessPure (AuthorGuessIO { authorGuessEnv = env
+                               , authorGuessLocalDarcs = darcsLocalF
+                               , authorGuessGlobalDarcs = darcsGlobalF
+                               , authorGuessLocalGit = gitLocal
+                               , authorGuessGlobalGit = gitGlobal })
     = mconcat
         [ emailEnv env
         , gitGlobal
@@ -275,12 +277,13 @@ authorGuessIO = AuthorGuessIO
 type AuthorGuess   = (Flag String, Flag String)
 type Enviro        = [(String, String)]
 data GitLoc        = Local | Global
-data AuthorGuessIO = AuthorGuessIO
-    Enviro         -- ^ Environment lookup table
-    (Maybe String) -- ^ Contents of local darcs author info
-    (Maybe String) -- ^ Contents of global darcs author info
-    AuthorGuess    -- ^ Git config --local
-    AuthorGuess    -- ^ Git config --global
+data AuthorGuessIO = AuthorGuessIO {
+    authorGuessEnv         :: Enviro,         -- ^ Environment lookup table
+    authorGuessLocalDarcs  :: (Maybe String), -- ^ Contents of local darcs author info
+    authorGuessGlobalDarcs :: (Maybe String), -- ^ Contents of global darcs author info
+    authorGuessLocalGit    :: AuthorGuess,   -- ^ Git config --local
+    authorGuessGlobalGit   :: AuthorGuess    -- ^ Git config --global
+  }
 
 darcsEnv :: Enviro -> AuthorGuess
 darcsEnv = maybe mempty nameAndMail . lookup "DARCS_EMAIL"

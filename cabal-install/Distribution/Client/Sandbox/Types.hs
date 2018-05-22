@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Sandbox.Types
@@ -13,12 +12,12 @@ module Distribution.Client.Sandbox.Types (
   SandboxPackageInfo(..)
   ) where
 
-import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
-import Distribution.Client.Types (SourcePackage)
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid
-#endif
+import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
+import Distribution.Client.Types (UnresolvedSourcePackage)
+
 import qualified Data.Set as S
 
 -- | Are we using a sandbox?
@@ -26,10 +25,12 @@ data UseSandbox = UseSandbox FilePath | NoSandbox
 
 instance Monoid UseSandbox where
   mempty = NoSandbox
+  mappend = (<>)
 
-  NoSandbox        `mappend` s                  = s
-  u0@(UseSandbox _) `mappend` NoSandbox         = u0
-  (UseSandbox   _)  `mappend` u1@(UseSandbox _) = u1
+instance Semigroup UseSandbox where
+  NoSandbox         <> s                 = s
+  u0@(UseSandbox _) <> NoSandbox         = u0
+  (UseSandbox _)    <> u1@(UseSandbox _) = u1
 
 -- | Convert a @UseSandbox@ value to a boolean. Useful in conjunction with
 -- @when@.
@@ -46,11 +47,11 @@ whenUsingSandbox (UseSandbox sandboxDir) act = act sandboxDir
 -- | Data about the packages installed in the sandbox that is passed from
 -- 'reinstallAddSourceDeps' to the solver.
 data SandboxPackageInfo = SandboxPackageInfo {
-  modifiedAddSourceDependencies :: ![SourcePackage],
+  modifiedAddSourceDependencies :: ![UnresolvedSourcePackage],
   -- ^ Modified add-source deps that we want to reinstall. These are guaranteed
   -- to be already installed in the sandbox.
 
-  otherAddSourceDependencies    :: ![SourcePackage],
+  otherAddSourceDependencies    :: ![UnresolvedSourcePackage],
   -- ^ Remaining add-source deps. Some of these may be not installed in the
   -- sandbox.
 

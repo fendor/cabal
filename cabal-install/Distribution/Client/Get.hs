@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Get
@@ -18,46 +17,41 @@ module Distribution.Client.Get (
     get
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude hiding (get)
+
 import Distribution.Package
          ( PackageId, packageId, packageName )
 import Distribution.Simple.Setup
          ( Flag(..), fromFlag, fromFlagOrDefault, flagToMaybe )
 import Distribution.Simple.Utils
-         ( notice, die, info, writeFileAtomic )
+         ( notice, die', info, rawSystemExitCode, writeFileAtomic )
 import Distribution.Verbosity
          ( Verbosity )
 import Distribution.Text(display)
 import qualified Distribution.PackageDescription as PD
 
 import Distribution.Client.Setup
-         ( GlobalFlags(..), GetFlags(..) )
+         ( GlobalFlags(..), GetFlags(..), RepoContext(..) )
 import Distribution.Client.Types
 import Distribution.Client.Targets
 import Distribution.Client.Dependency
 import Distribution.Client.FetchUtils
-import Distribution.Client.HttpUtils
-        ( configureTransport, HttpTransport(..) )
 import qualified Distribution.Client.Tar as Tar (extractTarGzFile)
 import Distribution.Client.IndexUtils as IndexUtils
-        ( getSourcePackages )
+        ( getSourcePackagesAtIndexState )
 import Distribution.Client.Compat.Process
         ( readProcessWithExitCode )
 import Distribution.Compat.Exception
         ( catchIO )
 
+import Distribution.Solver.Types.SourcePackage
+
 import Control.Exception
          ( finally )
 import Control.Monad
-         ( filterM, forM_, unless, when )
-import Data.List
-         ( sortBy )
+         ( forM_, mapM_ )
 import qualified Data.Map
-import Data.Maybe
-         ( listToMaybe, mapMaybe )
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid
-         ( mempty )
-#endif
 import Data.Ord
          ( comparing )
 import System.Directory
@@ -68,13 +62,11 @@ import System.Exit
          ( ExitCode(..) )
 import System.FilePath
          ( (</>), (<.>), addTrailingPathSeparator )
-import System.Process
-         ( rawSystem )
 
 
 -- | Entry point for the 'cabal get' command.
 get :: Verbosity
-    -> [Repo]
+    -> RepoContext
     -> GlobalFlags
     -> GetFlags
     -> [UserTarget]
@@ -82,24 +74,24 @@ get :: Verbosity
 get verbosity _ _ _ [] =
     notice verbosity "No packages requested. Nothing to do."
 
-get verbosity repos globalFlags getFlags userTargets = do
+get verbosity repoCtxt globalFlags getFlags userTargets = do
   let useFork = case (getSourceRepository getFlags) of
         NoFlag -> False
         _      -> True
 
   unless useFork $
-    mapM_ checkTarget userTargets
+    mapM_ (checkTarget verbosity) userTargets
 
-  sourcePkgDb <- getSourcePackages verbosity repos
+  let idxState = flagToMaybe $ getIndexState getFlags
 
-  transport <- configureTransport verbosity (flagToMaybe (globalHttpTransport globalFlags))
+  sourcePkgDb <- getSourcePackagesAtIndexState verbosity repoCtxt idxState
 
-  pkgSpecifiers <- resolveUserTargets verbosity transport
+  pkgSpecifiers <- resolveUserTargets verbosity repoCtxt
                    (fromFlag $ globalWorldFile globalFlags)
                    (packageIndex sourcePkgDb)
                    userTargets
 
-  pkgs <- either (die . unlines . map show) return $
+  pkgs <- either (die' verbosity . unlines . map show) return $
             resolveWithoutDependencies
               (resolverParams sourcePkgDb pkgSpecifiers)
 
@@ -108,7 +100,7 @@ get verbosity repos globalFlags getFlags userTargets = do
 
   if useFork
     then fork pkgs
-    else unpack transport pkgs
+    else unpack pkgs
 
   where
     resolverParams sourcePkgDb pkgSpecifiers =
@@ -117,16 +109,16 @@ get verbosity repos globalFlags getFlags userTargets = do
 
     prefix = fromFlagOrDefault "" (getDestDir getFlags)
 
-    fork :: [SourcePackage] -> IO ()
+    fork :: [UnresolvedSourcePackage] -> IO ()
     fork pkgs = do
       let kind = fromFlag . getSourceRepository $ getFlags
       branchers <- findUsableBranchers
       mapM_ (forkPackage verbosity branchers prefix kind) pkgs
 
-    unpack :: HttpTransport -> [SourcePackage] -> IO ()
-    unpack transport pkgs = do
+    unpack :: [UnresolvedSourcePackage] -> IO ()
+    unpack pkgs = do
       forM_ pkgs $ \pkg -> do
-        location <- fetchPackage transport verbosity (packageSource pkg)
+        location <- fetchPackage verbosity repoCtxt (packageSource pkg)
         let pkgid = packageId pkg
             descOverride | usePristine = Nothing
                          | otherwise   = packageDescrOverride pkg
@@ -145,10 +137,10 @@ get verbosity repos globalFlags getFlags userTargets = do
       where
         usePristine = fromFlagOrDefault False (getPristine getFlags)
 
-checkTarget :: UserTarget -> IO ()
-checkTarget target = case target of
-    UserTargetLocalDir       dir  -> die (notTarball dir)
-    UserTargetLocalCabalFile file -> die (notTarball file)
+checkTarget :: Verbosity -> UserTarget -> IO ()
+checkTarget verbosity target = case target of
+    UserTargetLocalDir       dir  -> die' verbosity (notTarball dir)
+    UserTargetLocalCabalFile file -> die' verbosity (notTarball file)
     _                             -> return ()
   where
     notTarball t =
@@ -167,10 +159,10 @@ unpackPackage verbosity prefix pkgid descOverride pkgPath = do
         pkgdir     = prefix </> pkgdirname
         pkgdir'    = addTrailingPathSeparator pkgdir
     existsDir  <- doesDirectoryExist pkgdir
-    when existsDir $ die $
+    when existsDir $ die' verbosity $
      "The directory \"" ++ pkgdir' ++ "\" already exists, not unpacking."
     existsFile  <- doesFileExist pkgdir
-    when existsFile $ die $
+    when existsFile $ die' verbosity $
      "A file \"" ++ pkgdir ++ "\" is in the way, not unpacking."
     notice verbosity $ "Unpacking to " ++ pkgdir'
     Tar.extractTarGzFile prefix pkgdirname pkgPath
@@ -230,7 +222,7 @@ forkPackage :: Verbosity
                -- be created.
             -> (Maybe PD.RepoKind)
                -- ^ Which repo to choose.
-            -> SourcePackage
+            -> SourcePackage loc
                -- ^ The package to fork.
             -> IO ()
 forkPackage verbosity branchers prefix kind src = do
@@ -241,11 +233,11 @@ forkPackage verbosity branchers prefix kind src = do
 
     destDirExists <- doesDirectoryExist destdir
     when destDirExists $ do
-        die ("The directory " ++ show destdir ++ " already exists, not forking.")
+        die' verbosity ("The directory " ++ show destdir ++ " already exists, not forking.")
 
     destFileExists  <- doesFileExist destdir
     when destFileExists $ do
-        die ("A file " ++ show destdir ++ " is in the way, not forking.")
+        die' verbosity ("A file " ++ show destdir ++ " is in the way, not forking.")
 
     let repos = PD.sourceRepos desc
     case findBranchCmd branchers repos kind of
@@ -253,11 +245,11 @@ forkPackage verbosity branchers prefix kind src = do
             exitCode <- io verbosity destdir
             case exitCode of
                 ExitSuccess -> return ()
-                ExitFailure _ -> die ("Couldn't fork package " ++ pkgid)
+                ExitFailure _ -> die' verbosity ("Couldn't fork package " ++ pkgid)
         Nothing -> case repos of
-            [] -> die ("Package " ++ pkgid
+            [] -> die' verbosity ("Package " ++ pkgid
                        ++ " does not have any source repositories.")
-            _ -> die ("Package " ++ pkgid
+            _ -> die' verbosity ("Package " ++ pkgid
                       ++ " does not have any usable source repositories.")
 
 -- | Given a set of possible branchers, and a set of possible source
@@ -299,7 +291,7 @@ branchBzr = Brancher "bzr" $ \repo -> do
          Nothing -> ["branch", src, dst]
     return $ BranchCmd $ \verbosity dst -> do
         notice verbosity ("bzr: branch " ++ show src)
-        rawSystem "bzr" (args dst)
+        rawSystemExitCode verbosity "bzr" (args dst)
 
 -- | Branch driver for Darcs.
 branchDarcs :: Brancher
@@ -310,29 +302,29 @@ branchDarcs = Brancher "darcs" $ \repo -> do
          Nothing -> ["get", src, dst]
     return $ BranchCmd $ \verbosity dst -> do
         notice verbosity ("darcs: get " ++ show src)
-        rawSystem "darcs" (args dst)
+        rawSystemExitCode verbosity "darcs" (args dst)
 
 -- | Branch driver for Git.
 branchGit :: Brancher
 branchGit = Brancher "git" $ \repo -> do
     src <- PD.repoLocation repo
-    let branchArgs = case PD.repoBranch repo of
-         Just b -> ["--branch", b]
-         Nothing -> []
-    let postClone dst = case PD.repoTag repo of
+    let postClone verbosity dst = case PD.repoTag repo of
          Just t -> do
              cwd <- getCurrentDirectory
              setCurrentDirectory dst
              finally
-                 (rawSystem "git" (["checkout", t] ++ branchArgs))
+                 (rawSystemExitCode verbosity "git" ["checkout", t])
                  (setCurrentDirectory cwd)
          Nothing -> return ExitSuccess
     return $ BranchCmd $ \verbosity dst -> do
         notice verbosity ("git: clone " ++ show src)
-        code <- rawSystem "git" (["clone", src, dst] ++ branchArgs)
+        code <- rawSystemExitCode verbosity "git" (["clone", src, dst] ++
+                    case PD.repoBranch repo of
+                        Nothing -> []
+                        Just b -> ["--branch", b])
         case code of
             ExitFailure _ -> return code
-            ExitSuccess -> postClone dst
+            ExitSuccess -> postClone verbosity  dst
 
 -- | Branch driver for Mercurial.
 branchHg :: Brancher
@@ -347,7 +339,7 @@ branchHg = Brancher "hg" $ \repo -> do
     let args dst = ["clone", src, dst] ++ branchArgs ++ tagArgs
     return $ BranchCmd $ \verbosity dst -> do
         notice verbosity ("hg: clone " ++ show src)
-        rawSystem "hg" (args dst)
+        rawSystemExitCode verbosity "hg" (args dst)
 
 -- | Branch driver for Subversion.
 branchSvn :: Brancher
@@ -356,4 +348,4 @@ branchSvn = Brancher "svn" $ \repo -> do
     let args dst = ["checkout", src, dst]
     return $ BranchCmd $ \verbosity dst -> do
         notice verbosity ("svn: checkout " ++ show src)
-        rawSystem "svn" (args dst)
+        rawSystemExitCode verbosity "svn" (args dst)

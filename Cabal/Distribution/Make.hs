@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Make
@@ -56,28 +59,28 @@
 
 module Distribution.Make (
         module Distribution.Package,
-        License(..), Version(..),
+        License(..), Version,
         defaultMain, defaultMainArgs, defaultMainNoRead
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 -- local
 import Distribution.Compat.Exception
-import Distribution.Package --must not specify imports, since we're exporting moule.
-import Distribution.Simple.Program(defaultProgramConfiguration)
+import Distribution.Package
+import Distribution.Simple.Program
 import Distribution.PackageDescription
 import Distribution.Simple.Setup
 import Distribution.Simple.Command
 
-import Distribution.Simple.Utils (rawSystemExit, cabalVersion)
+import Distribution.Simple.Utils
 
-import Distribution.License (License(..))
+import Distribution.License
 import Distribution.Version
-         ( Version(..) )
 import Distribution.Text
-         ( display )
 
 import System.Environment (getArgs, getProgName)
-import Data.List  (intercalate)
 import System.Exit
 
 defaultMain :: IO ()
@@ -115,7 +118,7 @@ defaultMainHelper args =
     printVersion        = putStrLn $ "Cabal library version "
                                   ++ display cabalVersion
 
-    progs = defaultProgramConfiguration
+    progs = defaultProgramDb
     commands =
       [configureCommand progs `commandAddAction` configureAction
       ,buildCommand     progs `commandAddAction` buildAction
@@ -143,6 +146,8 @@ copyAction flags args = do
   let destArgs = case fromFlag $ copyDest flags of
         NoCopyDest      -> ["install"]
         CopyTo path     -> ["copy", "destdir=" ++ path]
+        CopyToDb _      -> error "CopyToDb not supported via Make"
+
   rawSystemExit (fromFlag $ copyVerbosity flags) "make" destArgs
 
 installAction :: InstallFlags -> [String] -> IO ()

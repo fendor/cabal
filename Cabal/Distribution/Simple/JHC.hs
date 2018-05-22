@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.JHC
@@ -16,48 +19,34 @@ module Distribution.Simple.JHC (
         installLib, installExe
  ) where
 
-import Distribution.PackageDescription as PD
-       ( PackageDescription(..), BuildInfo(..), Executable(..)
-       , Library(..), libModules, hcOptions, usedExtensions )
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.PackageDescription as PD hiding (Flag)
 import Distribution.InstalledPackageInfo
-         ( emptyInstalledPackageInfo, )
 import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(..), ComponentLocalBuildInfo(..) )
 import Distribution.Simple.BuildPaths
-                                ( autogenModulesDir, exeExtension )
 import Distribution.Simple.Compiler
-         ( CompilerFlavor(..), CompilerId(..), Compiler(..), AbiTag(..)
-         , PackageDBStack, Flag, languageToFlags, extensionsToFlags )
 import Language.Haskell.Extension
-         ( Language(Haskell98), Extension(..), KnownExtension(..))
 import Distribution.Simple.Program
-         ( ConfiguredProgram(..), jhcProgram, ProgramConfiguration
-         , userMaybeSpecifyPath, requireProgramVersion, lookupProgram
-         , rawSystemProgram, rawSystemProgramStdoutConf )
+import Distribution.Types.MungedPackageId (mungedName)
+import Distribution.Types.PackageId
+import Distribution.Types.UnitId
 import Distribution.Version
-         ( Version(..), orLaterVersion )
 import Distribution.Package
-         ( Package(..), InstalledPackageId(InstalledPackageId),
-           pkgName, pkgVersion, )
 import Distribution.Simple.Utils
-        ( createDirectoryIfMissingVerbose, writeFileAtomic
-        , installOrdinaryFile, installExecutableFile
-        , intercalate )
-import System.FilePath          ( (</>) )
 import Distribution.Verbosity
 import Distribution.Text
-         ( Text(parse), display )
+
+import System.FilePath          ( (</>) )
 import Distribution.Compat.ReadP
     ( readP_to_S, string, skipSpaces )
 import Distribution.System ( Platform )
 
-import Data.List                ( nub )
-import Data.Char                ( isSpace )
-import qualified Data.Map as M  ( empty )
-import Data.Maybe               ( fromMaybe )
+import qualified Data.Map as Map  ( empty )
 
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 
@@ -66,12 +55,12 @@ import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 -- Configuring
 
 configure :: Verbosity -> Maybe FilePath -> Maybe FilePath
-          -> ProgramConfiguration -> IO (Compiler, Maybe Platform, ProgramConfiguration)
-configure verbosity hcPath _hcPkgPath conf = do
+          -> ProgramDb -> IO (Compiler, Maybe Platform, ProgramDb)
+configure verbosity hcPath _hcPkgPath progdb = do
 
-  (jhcProg, _, conf') <- requireProgramVersion verbosity
-                           jhcProgram (orLaterVersion (Version [0,7,2] []))
-                           (userMaybeSpecifyPath "jhc" hcPath conf)
+  (jhcProg, _, progdb') <- requireProgramVersion verbosity
+                           jhcProgram (orLaterVersion (mkVersion [0,7,2]))
+                           (userMaybeSpecifyPath "jhc" hcPath progdb)
 
   let Just version = programVersion jhcProg
       comp = Compiler {
@@ -80,34 +69,34 @@ configure verbosity hcPath _hcPkgPath conf = do
         compilerCompat         = [],
         compilerLanguages      = jhcLanguages,
         compilerExtensions     = jhcLanguageExtensions,
-        compilerProperties     = M.empty
+        compilerProperties     = Map.empty
       }
       compPlatform = Nothing
-  return (comp, compPlatform, conf')
+  return (comp, compPlatform, progdb')
 
 jhcLanguages :: [(Language, Flag)]
 jhcLanguages = [(Haskell98, "")]
 
 -- | The flags for the supported extensions
-jhcLanguageExtensions :: [(Extension, Flag)]
+jhcLanguageExtensions :: [(Extension, Maybe Flag)]
 jhcLanguageExtensions =
-    [(EnableExtension  TypeSynonymInstances       , "")
-    ,(DisableExtension TypeSynonymInstances       , "")
-    ,(EnableExtension  ForeignFunctionInterface   , "")
-    ,(DisableExtension ForeignFunctionInterface   , "")
-    ,(EnableExtension  ImplicitPrelude            , "") -- Wrong
-    ,(DisableExtension ImplicitPrelude            , "--noprelude")
-    ,(EnableExtension  CPP                        , "-fcpp")
-    ,(DisableExtension CPP                        , "-fno-cpp")
+    [(EnableExtension  TypeSynonymInstances       , Nothing)
+    ,(DisableExtension TypeSynonymInstances       , Nothing)
+    ,(EnableExtension  ForeignFunctionInterface   , Nothing)
+    ,(DisableExtension ForeignFunctionInterface   , Nothing)
+    ,(EnableExtension  ImplicitPrelude            , Nothing) -- Wrong
+    ,(DisableExtension ImplicitPrelude            , Just "--noprelude")
+    ,(EnableExtension  CPP                        , Just "-fcpp")
+    ,(DisableExtension CPP                        , Just "-fno-cpp")
     ]
 
-getInstalledPackages :: Verbosity -> PackageDBStack -> ProgramConfiguration
+getInstalledPackages :: Verbosity -> PackageDBStack -> ProgramDb
                     -> IO InstalledPackageIndex
-getInstalledPackages verbosity _packageDBs conf = do
+getInstalledPackages verbosity _packageDBs progdb = do
    -- jhc --list-libraries lists all available libraries.
    -- How shall I find out, whether they are global or local
    -- without checking all files and locations?
-   str <- rawSystemProgramStdoutConf verbosity jhcProgram conf ["--list-libraries"]
+   str <- getDbProgramOutput verbosity jhcProgram progdb ["--list-libraries"]
    let pCheck :: [(a, String)] -> [a]
        pCheck rs = [ r | (r,s) <- rs, all isSpace s ]
    let parseLine ln =
@@ -116,8 +105,7 @@ getInstalledPackages verbosity _packageDBs conf = do
    return $
       PackageIndex.fromList $
       map (\p -> emptyInstalledPackageInfo {
-                    InstalledPackageInfo.installedPackageId =
-                       InstalledPackageId (display p),
+                    InstalledPackageInfo.installedUnitId = mkLegacyUnitId p,
                     InstalledPackageInfo.sourcePackageId = p
                  }) $
       concatMap parseLine $
@@ -138,9 +126,9 @@ buildLib verbosity pkg_descr lbi lib clbi = do
       pfile = buildDir lbi </> "jhc-pkg.conf"
       hlfile= buildDir lbi </> (pkgid ++ ".hl")
   writeFileAtomic pfile . BS.Char8.pack $ jhcPkgConf pkg_descr
-  rawSystemProgram verbosity jhcProg $
+  runProgram verbosity jhcProg $
      ["--build-hl="++pfile, "-o", hlfile] ++
-     args ++ map display (libModules lib)
+     args ++ map display (allLibModules lib clbi)
 
 -- | Building an executable for JHC.
 -- Currently C source files are not supported.
@@ -149,9 +137,9 @@ buildExe :: Verbosity -> PackageDescription -> LocalBuildInfo
 buildExe verbosity _pkg_descr lbi exe clbi = do
   let Just jhcProg = lookupProgram jhcProgram (withPrograms lbi)
   let exeBi = buildInfo exe
-  let out   = buildDir lbi </> exeName exe
+  let out   = buildDir lbi </> display (exeName exe)
   let args  = constructJHCCmdLine lbi exeBi clbi (buildDir lbi) verbosity
-  rawSystemProgram verbosity jhcProg (["-o",out] ++ args ++ [modulePath exe])
+  runProgram verbosity jhcProg (["-o",out] ++ args ++ [modulePath exe])
 
 constructJHCCmdLine :: LocalBuildInfo -> BuildInfo -> ComponentLocalBuildInfo
                     -> FilePath -> Verbosity -> [String]
@@ -162,18 +150,21 @@ constructJHCCmdLine lbi bi clbi _odir verbosity =
      ++ extensionsToFlags (compiler lbi) (usedExtensions bi)
      ++ ["--noauto","-i-"]
      ++ concat [["-i", l] | l <- nub (hsSourceDirs bi)]
-     ++ ["-i", autogenModulesDir lbi]
+     ++ ["-i", autogenComponentModulesDir lbi clbi]
+     ++ ["-i", autogenPackageModulesDir lbi]
      ++ ["-optc" ++ opt | opt <- PD.ccOptions bi]
      -- It would be better if JHC would accept package names with versions,
      -- but JHC-0.7.2 doesn't accept this.
      -- Thus, we have to strip the version with 'pkgName'.
-     ++ (concat [ ["-p", display (pkgName pkgid)]
+     ++ (concat [ ["-p", display (mungedName pkgid)]
                 | (_, pkgid) <- componentPackageDeps clbi ])
 
 jhcPkgConf :: PackageDescription -> String
 jhcPkgConf pd =
   let sline name sel = name ++ ": "++sel pd
-      lib = fromMaybe (error "no library available") . library
+      lib pd' = case library pd' of
+                Just lib' -> lib'
+                Nothing -> error "no library available"
       comma = intercalate "," . map display
   in unlines [sline "name" (display . pkgName . packageId)
              ,sline "version" (display . pkgVersion . packageId)
@@ -181,15 +172,23 @@ jhcPkgConf pd =
              ,sline "hidden-modules" (comma . otherModules . libBuildInfo . lib)
              ]
 
-installLib :: Verbosity -> FilePath -> FilePath -> PackageDescription -> Library -> IO ()
-installLib verb dest build_dir pkg_descr _ = do
+installLib :: Verbosity
+           -> LocalBuildInfo
+           -> FilePath
+           -> FilePath
+           -> FilePath
+           -> PackageDescription
+           -> Library
+           -> ComponentLocalBuildInfo
+           -> IO ()
+installLib verb _lbi dest _dyn_dest build_dir pkg_descr _lib _clbi = do
     let p = display (packageId pkg_descr)++".hl"
     createDirectoryIfMissingVerbose verb True dest
     installOrdinaryFile verb (build_dir </> p) (dest </> p)
 
 installExe :: Verbosity -> FilePath -> FilePath -> (FilePath,FilePath) -> PackageDescription -> Executable -> IO ()
 installExe verb dest build_dir (progprefix,progsuffix) _ exe = do
-    let exe_name = exeName exe
+    let exe_name = display $ exeName exe
         src = exe_name </> exeExtension
         out   = (progprefix ++ exe_name ++ progsuffix) </> exeExtension
     createDirectoryIfMissingVerbose verb True dest

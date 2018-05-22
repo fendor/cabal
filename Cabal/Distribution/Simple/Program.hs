@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Program
@@ -11,14 +14,14 @@
 -- 'ConfiguredProgram' is a 'Program' that has been found on the current
 -- machine and is ready to be run (possibly with some user-supplied default
 -- args). Configuring a program involves finding its location and if necessary
--- finding its version. There is also a 'ProgramConfiguration' type which holds
+-- finding its version. There is also a 'ProgramDb' type which holds
 -- configured and not-yet configured programs. It is the parameter to lots of
 -- actions elsewhere in Cabal that need to look up and run programs. If we had
--- a Cabal monad, the 'ProgramConfiguration' would probably be a reader or
--- state component of it. 
+-- a Cabal monad, the 'ProgramDb' would probably be a reader or
+-- state component of it.
 --
 -- The module also defines all the known built-in 'Program's and the
--- 'defaultProgramConfiguration' which contains them all.
+-- 'defaultProgramDb' which contains them all.
 --
 -- One nice thing about using it is that any program that is
 -- registered with Cabal will get some \"configure\" and \".cabal\"
@@ -38,7 +41,8 @@ module Distribution.Simple.Program (
     , ProgramSearchPath
     , ProgramSearchPathEntry(..)
     , simpleProgram
-    , findProgramLocation
+    , findProgramOnSearchPath
+    , defaultProgramSearchPath
     , findProgramVersion
 
     -- * Configured program and related functions
@@ -62,10 +66,10 @@ module Distribution.Simple.Program (
     , builtinPrograms
 
     -- * The collection of configured programs we can run
-    , ProgramConfiguration
-    , emptyProgramConfiguration
-    , defaultProgramConfiguration
-    , restoreProgramConfiguration
+    , ProgramDb
+    , defaultProgramDb
+    , emptyProgramDb
+    , restoreProgramDb
     , addKnownProgram
     , addKnownPrograms
     , lookupKnownProgram
@@ -108,6 +112,7 @@ module Distribution.Simple.Program (
     , c2hsProgram
     , cpphsProgram
     , hscolourProgram
+    , doctestProgram
     , haddockProgram
     , greencardProgram
     , ldProgram
@@ -117,27 +122,31 @@ module Distribution.Simple.Program (
     , hpcProgram
 
     -- * deprecated
+    , ProgramConfiguration
+    , emptyProgramConfiguration
+    , defaultProgramConfiguration
+    , restoreProgramConfiguration
     , rawSystemProgram
     , rawSystemProgramStdout
     , rawSystemProgramConf
     , rawSystemProgramStdoutConf
     , findProgramOnPath
+    , findProgramLocation
 
     ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
 import Distribution.Simple.Program.Db
 import Distribution.Simple.Program.Builtin
-
+import Distribution.Simple.Program.Find
 import Distribution.Simple.Utils
-         ( die, findProgramLocation, findProgramVersion )
 import Distribution.Verbosity
-         ( Verbosity )
-
 
 -- | Runs the given configured program.
---
 runProgram :: Verbosity          -- ^Verbosity
            -> ConfiguredProgram  -- ^The program to run
            -> [ProgArg]          -- ^Any /extra/ arguments to add
@@ -165,7 +174,7 @@ runDbProgram :: Verbosity  -- ^verbosity
              -> IO ()
 runDbProgram verbosity prog programDb args =
   case lookupProgram prog programDb of
-    Nothing             -> die notFound
+    Nothing             -> die' verbosity notFound
     Just configuredProg -> runProgram verbosity configuredProg args
  where
    notFound = "The program '" ++ programName prog
@@ -180,7 +189,7 @@ getDbProgramOutput :: Verbosity  -- ^verbosity
                    -> IO String
 getDbProgramOutput verbosity prog programDb args =
   case lookupProgram prog programDb of
-    Nothing             -> die notFound
+    Nothing             -> die' verbosity notFound
     Just configuredProg -> getProgramOutput verbosity configuredProg args
  where
    notFound = "The program '" ++ programName prog
@@ -191,32 +200,42 @@ getDbProgramOutput verbosity prog programDb args =
 -- Deprecated aliases
 --
 
+{-# DEPRECATED rawSystemProgram "use runProgram instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 rawSystemProgram :: Verbosity -> ConfiguredProgram
                  -> [ProgArg] -> IO ()
 rawSystemProgram = runProgram
 
+{-# DEPRECATED rawSystemProgramStdout "use getProgramOutput instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 rawSystemProgramStdout :: Verbosity -> ConfiguredProgram
                        -> [ProgArg] -> IO String
 rawSystemProgramStdout = getProgramOutput
 
+{-# DEPRECATED rawSystemProgramConf "use runDbProgram instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 rawSystemProgramConf :: Verbosity  -> Program -> ProgramConfiguration
                      -> [ProgArg] -> IO ()
 rawSystemProgramConf = runDbProgram
 
+{-# DEPRECATED rawSystemProgramStdoutConf "use getDbProgramOutput instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 rawSystemProgramStdoutConf :: Verbosity -> Program -> ProgramConfiguration
                            -> [ProgArg] -> IO String
 rawSystemProgramStdoutConf = getDbProgramOutput
 
+{-# DEPRECATED ProgramConfiguration "use ProgramDb instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 type ProgramConfiguration = ProgramDb
 
+{-# DEPRECATED emptyProgramConfiguration "use emptyProgramDb instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
+{-# DEPRECATED defaultProgramConfiguration "use defaultProgramDb instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 emptyProgramConfiguration, defaultProgramConfiguration :: ProgramConfiguration
 emptyProgramConfiguration   = emptyProgramDb
 defaultProgramConfiguration = defaultProgramDb
 
+{-# DEPRECATED restoreProgramConfiguration "use restoreProgramDb instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 restoreProgramConfiguration :: [Program] -> ProgramConfiguration
                                          -> ProgramConfiguration
 restoreProgramConfiguration = restoreProgramDb
 
-{-# DEPRECATED findProgramOnPath "use findProgramLocation instead" #-}
+{-# DEPRECATED findProgramOnPath "use findProgramOnSearchPath instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
 findProgramOnPath :: String -> Verbosity -> IO (Maybe FilePath)
-findProgramOnPath = flip findProgramLocation
+findProgramOnPath name verbosity =
+    fmap (fmap fst) $
+    findProgramOnSearchPath verbosity defaultProgramSearchPath name

@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 module Distribution.Utils.NubList
     ( NubList    -- opaque
     , toNubList  -- smart construtor
@@ -11,19 +11,17 @@ module Distribution.Utils.NubList
     , overNubListR
     ) where
 
-import Distribution.Compat.Binary
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid
-#endif
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Distribution.Simple.Utils (ordNub, listUnion, ordNubRight, listUnionRight)
+import Distribution.Simple.Utils
 
 import qualified Text.Read as R
 
 -- | NubList : A de-duplicated list that maintains the original order.
 newtype NubList a =
     NubList { fromNubList :: [a] }
-    deriving Eq
+    deriving (Eq, Typeable)
 
 -- NubList assumes that nub retains the list order while removing duplicate
 -- elements (keeping the first occurence). Documentation for "Data.List.nub"
@@ -54,7 +52,10 @@ overNubList f (NubList list) = toNubList . f $ list
 
 instance Ord a => Monoid (NubList a) where
     mempty = NubList []
-    mappend (NubList xs) (NubList ys) = NubList $ xs `listUnion` ys
+    mappend = (<>)
+
+instance Ord a => Semigroup (NubList a) where
+    (NubList xs) <> (NubList ys) = NubList $ xs `listUnion` ys
 
 instance Show a => Show (NubList a) where
     show (NubList list) = show list
@@ -91,7 +92,10 @@ overNubListR f (NubListR list) = toNubListR . f $ list
 
 instance Ord a => Monoid (NubListR a) where
   mempty = NubListR []
-  mappend (NubListR xs) (NubListR ys) = NubListR $ xs `listUnionRight` ys
+  mappend = (<>)
+
+instance Ord a => Semigroup (NubListR a) where
+  (NubListR xs) <> (NubListR ys) = NubListR $ xs `listUnionRight` ys
 
 instance Show a => Show (NubListR a) where
   show (NubListR list) = show list

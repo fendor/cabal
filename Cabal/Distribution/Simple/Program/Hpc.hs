@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Program.Hpc
@@ -13,14 +16,19 @@ module Distribution.Simple.Program.Hpc
     , union
     ) where
 
-import Distribution.ModuleName ( ModuleName )
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Control.Monad (mapM)
+import System.Directory (makeRelativeToCurrentDirectory)
+
+import Distribution.ModuleName
 import Distribution.Simple.Program.Run
-         ( ProgramInvocation, programInvocation, runProgramInvocation )
-import Distribution.Simple.Program.Types ( ConfiguredProgram(..) )
-import Distribution.Text ( display )
-import Distribution.Simple.Utils ( warn )
-import Distribution.Verbosity ( Verbosity )
-import Distribution.Version ( Version(..), orLaterVersion, withinRange )
+import Distribution.Simple.Program.Types
+import Distribution.Text
+import Distribution.Simple.Utils
+import Distribution.Verbosity
+import Distribution.Version
 
 -- | Invoke hpc with the given parameters.
 --
@@ -52,10 +60,13 @@ markup hpc hpcVer verbosity tixFile hpcDirs destDir excluded = do
                         ++ show droppedDirs
             return passedDirs
 
+    -- Prior to GHC 8.0, hpc assumes all .mix paths are relative.
+    hpcDirs'' <- mapM makeRelativeToCurrentDirectory hpcDirs'
+
     runProgramInvocation verbosity
-      (markupInvocation hpc tixFile hpcDirs' destDir excluded)
+      (markupInvocation hpc tixFile hpcDirs'' destDir excluded)
   where
-    version07 = Version [0, 7] []
+    version07 = mkVersion [0, 7]
     (passedDirs, droppedDirs) = splitAt 1 hpcDirs
 
 markupInvocation :: ConfiguredProgram

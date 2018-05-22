@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Install
@@ -16,21 +19,29 @@ module Distribution.Simple.Install (
         install,
   ) where
 
-import Distribution.PackageDescription (
-        PackageDescription(..), BuildInfo(..), Library(..),
-        hasLibs, withLib, hasExes, withExe )
-import Distribution.Package (Package(..))
-import Distribution.Simple.LocalBuildInfo (
-        LocalBuildInfo(..), InstallDirs(..), absoluteInstallDirs,
-        substPathTemplate, withLibLBI)
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Types.TargetInfo
+import Distribution.Types.LocalBuildInfo
+import Distribution.Types.ForeignLib
+import Distribution.Types.PackageDescription
+import Distribution.Types.UnqualComponentName
+import Distribution.Types.ExecutableScope
+
+import Distribution.Package
+import Distribution.PackageDescription
+import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.BuildPaths (haddockName, haddockPref)
 import Distribution.Simple.Utils
          ( createDirectoryIfMissingVerbose
          , installDirectoryContents, installOrdinaryFile, isInSearchPath
-         , die, info, notice, warn, matchDirFileGlob )
+         , die', info, noticeNoWrap, warn, matchDirFileGlob )
 import Distribution.Simple.Compiler
          ( CompilerFlavor(..), compilerFlavor )
-import Distribution.Simple.Setup (CopyFlags(..), fromFlag)
+import Distribution.Simple.Setup
+         ( CopyFlags(..), fromFlag, HaddockTarget(ForDevelopment) )
+import Distribution.Simple.BuildTarget
 
 import qualified Distribution.Simple.GHC   as GHC
 import qualified Distribution.Simple.GHCJS as GHCJS
@@ -38,12 +49,12 @@ import qualified Distribution.Simple.JHC   as JHC
 import qualified Distribution.Simple.LHC   as LHC
 import qualified Distribution.Simple.UHC   as UHC
 import qualified Distribution.Simple.HaskellSuite as HaskellSuite
+import Distribution.Compat.Graph (IsNode(..))
 
-import Control.Monad (when, unless)
 import System.Directory
          ( doesDirectoryExist, doesFileExist )
 import System.FilePath
-         ( takeFileName, takeDirectory, (</>), isAbsolute )
+         ( takeFileName, takeDirectory, (</>), isRelative )
 
 import Distribution.Verbosity
 import Distribution.Text
@@ -51,52 +62,79 @@ import Distribution.Text
 
 -- |Perform the \"@.\/setup install@\" and \"@.\/setup copy@\"
 -- actions.  Move files into place based on the prefix argument.
+--
+-- This does NOT register libraries, you should call 'register'
+-- to do that.
 
 install :: PackageDescription -- ^information from the .cabal file
         -> LocalBuildInfo -- ^information from the configure step
         -> CopyFlags -- ^flags sent to copy or install
         -> IO ()
 install pkg_descr lbi flags = do
-  let distPref  = fromFlag (copyDistPref flags)
-      verbosity = fromFlag (copyVerbosity flags)
-      copydest  = fromFlag (copyDest flags)
-      installDirs@(InstallDirs {
-         bindir     = binPref,
-         libdir     = libPref,
---         dynlibdir  = dynlibPref, --see TODO below
+  checkHasLibsOrExes
+  targets <- readTargetInfos verbosity pkg_descr lbi (copyArgs flags)
+
+  copyPackage verbosity pkg_descr lbi distPref copydest
+
+  -- It's not necessary to do these in build-order, but it's harmless
+  withNeededTargetsInBuildOrder' pkg_descr lbi (map nodeKey targets) $ \target ->
+    let comp = targetComponent target
+        clbi = targetCLBI target
+    in copyComponent verbosity pkg_descr lbi comp clbi copydest
+ where
+  distPref  = fromFlag (copyDistPref flags)
+  verbosity = fromFlag (copyVerbosity flags)
+  copydest  = fromFlag (copyDest flags)
+
+  checkHasLibsOrExes =
+    unless (hasLibs pkg_descr || hasForeignLibs pkg_descr || hasExes pkg_descr) $
+      die' verbosity "No executables and no library found. Nothing to do."
+
+-- | Copy package global files.
+copyPackage :: Verbosity -> PackageDescription
+            -> LocalBuildInfo -> FilePath -> CopyDest -> IO ()
+copyPackage verbosity pkg_descr lbi distPref copydest = do
+  let -- This is a bit of a hack, to handle files which are not
+      -- per-component (data files and Haddock files.)
+      InstallDirs {
          datadir    = dataPref,
+         -- NB: The situation with Haddock is a bit delicate.  On the
+         -- one hand, the easiest to understand Haddock documentation
+         -- path is pkgname-0.1, which means it's per-package (not
+         -- per-component).  But this means that it's impossible to
+         -- install Haddock documentation for internal libraries.  We'll
+         -- keep this constraint for now; this means you can't use
+         -- Cabal to Haddock internal libraries.  This does not seem
+         -- like a big problem.
          docdir     = docPref,
          htmldir    = htmlPref,
-         haddockdir = interfacePref,
-         includedir = incPref})
+         haddockdir = interfacePref}
+             -- Notice use of 'absoluteInstallDirs' (not the
+             -- per-component variant).  This means for non-library
+             -- packages we'll just pick a nondescriptive foo-0.1
              = absoluteInstallDirs pkg_descr lbi copydest
 
-      --TODO: decide if we need the user to be able to control the libdir
-      -- for shared libs independently of the one for static libs. If so
-      -- it should also have a flag in the command line UI
-      -- For the moment use dynlibdir = libdir
-      dynlibPref = libPref
-      progPrefixPref = substPathTemplate (packageId pkg_descr) lbi (progPrefix lbi)
-      progSuffixPref = substPathTemplate (packageId pkg_descr) lbi (progSuffix lbi)
-
-  unless (hasLibs pkg_descr || hasExes pkg_descr) $
-      die "No executables and no library found. Nothing to do."
-  docExists <- doesDirectoryExist $ haddockPref distPref pkg_descr
-  info verbosity ("directory " ++ haddockPref distPref pkg_descr ++
-                  " does exist: " ++ show docExists)
-
+  -- Install (package-global) data files
   installDataFiles verbosity pkg_descr dataPref
 
+  -- Install (package-global) Haddock files
+  -- TODO: these should be done per-library
+  docExists <- doesDirectoryExist $ haddockPref ForDevelopment distPref pkg_descr
+  info verbosity ("directory " ++ haddockPref ForDevelopment distPref pkg_descr ++
+                  " does exist: " ++ show docExists)
+
+  -- TODO: this is a bit questionable, Haddock files really should
+  -- be per library (when there are convenience libraries.)
   when docExists $ do
       createDirectoryIfMissingVerbose verbosity True htmlPref
       installDirectoryContents verbosity
-          (haddockPref distPref pkg_descr) htmlPref
+          (haddockPref ForDevelopment distPref pkg_descr) htmlPref
       -- setPermissionsRecursive [Read] htmlPref
       -- The haddock interface file actually already got installed
       -- in the recursive copy, but now we install it where we actually
       -- want it to be (normally the same place). We could remove the
       -- copy in htmlPref first.
-      let haddockInterfaceFileSrc  = haddockPref distPref pkg_descr
+      let haddockInterfaceFileSrc  = haddockPref ForDevelopment distPref pkg_descr
                                                    </> haddockName pkg_descr
           haddockInterfaceFileDest = interfacePref </> haddockName pkg_descr
       -- We only generate the haddock interface file for libs, So if the
@@ -114,51 +152,91 @@ install pkg_descr lbi flags = do
       [ installOrdinaryFile verbosity lfile (docPref </> takeFileName lfile)
       | lfile <- lfiles ]
 
-  let buildPref = buildDir lbi
-  when (hasLibs pkg_descr) $
-    notice verbosity ("Installing library in " ++ libPref)
-  when (hasExes pkg_descr) $ do
-    notice verbosity ("Installing executable(s) in " ++ binPref)
+-- | Copy files associated with a component.
+copyComponent :: Verbosity -> PackageDescription
+              -> LocalBuildInfo -> Component -> ComponentLocalBuildInfo
+              -> CopyDest
+              -> IO ()
+copyComponent verbosity pkg_descr lbi (CLib lib) clbi copydest = do
+    let InstallDirs{
+            libdir = libPref,
+            dynlibdir = dynlibPref,
+            includedir = incPref
+            } = absoluteComponentInstallDirs pkg_descr lbi (componentUnitId clbi) copydest
+        buildPref = componentBuildDir lbi clbi
+
+    case libName lib of
+        Nothing -> noticeNoWrap verbosity ("Installing library in " ++ libPref)
+        Just n -> noticeNoWrap verbosity ("Installing internal library " ++ display n ++ " in " ++ libPref)
+
+    -- install include files for all compilers - they may be needed to compile
+    -- haskell files (using the CPP extension)
+    installIncludeFiles verbosity lib lbi buildPref incPref
+
+    case compilerFlavor (compiler lbi) of
+      GHC   -> GHC.installLib   verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
+      GHCJS -> GHCJS.installLib verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
+      LHC   -> LHC.installLib   verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
+      JHC   -> JHC.installLib   verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
+      UHC   -> UHC.installLib   verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
+      HaskellSuite _ -> HaskellSuite.installLib
+                                verbosity lbi libPref dynlibPref buildPref pkg_descr lib clbi
+      _ -> die' verbosity $ "installing with "
+              ++ display (compilerFlavor (compiler lbi))
+              ++ " is not implemented"
+
+copyComponent verbosity pkg_descr lbi (CFLib flib) clbi copydest = do
+    let InstallDirs{
+            flibdir = flibPref
+            } = absoluteComponentInstallDirs pkg_descr lbi (componentUnitId clbi) copydest
+        buildPref = componentBuildDir lbi clbi
+
+    noticeNoWrap verbosity ("Installing foreign library " ++ unUnqualComponentName (foreignLibName flib) ++ " in " ++ flibPref)
+
+    case compilerFlavor (compiler lbi) of
+      GHC   -> GHC.installFLib   verbosity lbi flibPref buildPref pkg_descr flib
+      _ -> die' verbosity $ "installing foreign lib with "
+              ++ display (compilerFlavor (compiler lbi))
+              ++ " is not implemented"
+
+copyComponent verbosity pkg_descr lbi (CExe exe) clbi copydest = do
+    let installDirs = absoluteComponentInstallDirs pkg_descr lbi (componentUnitId clbi) copydest
+        -- the installers know how to find the actual location of the
+        -- binaries
+        buildPref = buildDir lbi
+        uid = componentUnitId clbi
+        pkgid = packageId pkg_descr
+        binPref | ExecutablePrivate <- exeScope exe = libexecdir installDirs
+                | otherwise = bindir installDirs
+        progPrefixPref = substPathTemplate pkgid lbi uid (progPrefix lbi)
+        progSuffixPref = substPathTemplate pkgid lbi uid (progSuffix lbi)
+        progFix = (progPrefixPref, progSuffixPref)
+    noticeNoWrap verbosity ("Installing executable " ++ display (exeName exe)
+                      ++ " in " ++ binPref)
     inPath <- isInSearchPath binPref
     when (not inPath) $
       warn verbosity ("The directory " ++ binPref
                       ++ " is not in the system search path.")
+    case compilerFlavor (compiler lbi) of
+      GHC   -> GHC.installExe   verbosity lbi binPref buildPref progFix pkg_descr exe
+      GHCJS -> GHCJS.installExe verbosity lbi binPref buildPref progFix pkg_descr exe
+      LHC   -> LHC.installExe   verbosity lbi binPref buildPref progFix pkg_descr exe
+      JHC   -> JHC.installExe   verbosity     binPref buildPref progFix pkg_descr exe
+      UHC   -> return ()
+      HaskellSuite {} -> return ()
+      _ -> die' verbosity $ "installing with "
+              ++ display (compilerFlavor (compiler lbi))
+              ++ " is not implemented"
 
-  -- install include files for all compilers - they may be needed to compile
-  -- haskell files (using the CPP extension)
-  when (hasLibs pkg_descr) $ installIncludeFiles verbosity pkg_descr incPref
-
-  case compilerFlavor (compiler lbi) of
-     GHC  -> do withLibLBI pkg_descr lbi $
-                  GHC.installLib verbosity lbi libPref dynlibPref buildPref pkg_descr
-                withExe pkg_descr $
-                  GHC.installExe verbosity lbi installDirs buildPref (progPrefixPref, progSuffixPref) pkg_descr
-     GHCJS-> do withLibLBI pkg_descr lbi $
-                  GHCJS.installLib verbosity lbi libPref dynlibPref buildPref pkg_descr
-                withExe pkg_descr $
-                  GHCJS.installExe verbosity lbi installDirs buildPref (progPrefixPref, progSuffixPref) pkg_descr
-     LHC  -> do withLibLBI pkg_descr lbi $
-                  LHC.installLib verbosity lbi libPref dynlibPref buildPref pkg_descr
-                withExe pkg_descr $
-                  LHC.installExe verbosity lbi installDirs buildPref (progPrefixPref, progSuffixPref) pkg_descr
-     JHC  -> do withLib pkg_descr $
-                  JHC.installLib verbosity libPref buildPref pkg_descr
-                withExe pkg_descr $
-                  JHC.installExe verbosity binPref buildPref (progPrefixPref, progSuffixPref) pkg_descr
-     UHC  -> do withLib pkg_descr $ UHC.installLib verbosity lbi libPref dynlibPref buildPref pkg_descr
-     HaskellSuite {} ->
-       withLib pkg_descr $
-         HaskellSuite.installLib verbosity lbi libPref dynlibPref buildPref pkg_descr
-     _    -> die $ "installing with "
-                ++ display (compilerFlavor (compiler lbi))
-                ++ " is not implemented"
-  -- register step should be performed by caller.
+-- Nothing to do for benchmark/testsuite
+copyComponent _ _ _ (CBench _) _ _ = return ()
+copyComponent _ _ _ (CTest _) _ _ = return ()
 
 -- | Install the files listed in data-files
 --
 installDataFiles :: Verbosity -> PackageDescription -> FilePath -> IO ()
 installDataFiles verbosity pkg_descr destDataDir =
-  flip mapM_ (dataFiles pkg_descr) $ \ file -> do
+  flip traverse_ (dataFiles pkg_descr) $ \ file -> do
     let srcDataDir = dataDir pkg_descr
     files <- matchDirFileGlob srcDataDir file
     let dir = takeDirectory file
@@ -167,26 +245,25 @@ installDataFiles verbosity pkg_descr destDataDir =
                                               (destDataDir </> file')
               | file' <- files ]
 
--- | Install the files listed in install-includes
+-- | Install the files listed in install-includes for a library
 --
-installIncludeFiles :: Verbosity -> PackageDescription -> FilePath -> IO ()
-installIncludeFiles verbosity
-  PackageDescription { library = Just lib } destIncludeDir = do
-
-  incs <- mapM (findInc relincdirs) (installIncludes lbi)
-  sequence_
-    [ do createDirectoryIfMissingVerbose verbosity True destDir
-         installOrdinaryFile verbosity srcFile destFile
-    | (relFile, srcFile) <- incs
-    , let destFile = destIncludeDir </> relFile
-          destDir  = takeDirectory destFile ]
+installIncludeFiles :: Verbosity -> Library -> LocalBuildInfo -> FilePath -> FilePath -> IO ()
+installIncludeFiles verbosity lib lbi buildPref destIncludeDir = do
+    let relincdirs = "." : filter isRelative (includeDirs libBi)
+        libBi = libBuildInfo lib
+        incdirs = [ baseDir lbi </> dir | dir <- relincdirs ]
+                  ++ [ buildPref </> dir | dir <- relincdirs ]
+    incs <- traverse (findInc incdirs) (installIncludes libBi)
+    sequence_
+      [ do createDirectoryIfMissingVerbose verbosity True destDir
+           installOrdinaryFile verbosity srcFile destFile
+      | (relFile, srcFile) <- incs
+      , let destFile = destIncludeDir </> relFile
+            destDir  = takeDirectory destFile ]
   where
-   relincdirs = "." : filter (not.isAbsolute) (includeDirs lbi)
-   lbi = libBuildInfo lib
-
-   findInc []         file = die ("can't find include file " ++ file)
+   baseDir lbi' = fromMaybe "" (takeDirectory <$> cabalFilePath lbi')
+   findInc []         file = die' verbosity ("can't find include file " ++ file)
    findInc (dir:dirs) file = do
      let path = dir </> file
      exists <- doesFileExist path
      if exists then return (file, path) else findInc dirs file
-installIncludeFiles _ _ _ = die "installIncludeFiles: Can't happen?"

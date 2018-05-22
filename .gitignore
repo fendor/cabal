@@ -1,6 +1,8 @@
 # trivial gitignore file
 .cabal-sandbox/
 cabal.sandbox.config
+cabal.project.local
+.ghc.environment.*
 cabal-dev/
 .hpc/
 *.hi
@@ -8,16 +10,20 @@ cabal-dev/
 *.p_hi
 *.prof
 *.tix
-cabal.config
 dist
 dist-*
+register.sh
+./cabal.config
+cabal-tests.log
 
 /Cabal/dist/
 /Cabal/tests/Setup
 /Cabal/Setup
+/Cabal/source-file-list
 
 /cabal-install/dist/
 /cabal-install/Setup
+/cabal-install/source-file-list
 
 
 # editor temp files
@@ -26,6 +32,7 @@ dist-*
 .#*
 *~
 .*.swp
+*.bak
 
 # GHC build
 
@@ -41,3 +48,13 @@ tags
 
 # stack artifacts
 /.stack-work/
+
+# Shake artifacts
+.shake*
+progress.txt
+
+# test files
+register.sh
+
+# python artifacts from documentation builds
+*.pyc

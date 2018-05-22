@@ -15,8 +15,10 @@
 
 module Distribution.Simple.PreProcess.Unlit (unlit,plain) where
 
-import Data.Char
-import Data.List
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Data.List (mapAccumL)
 
 data Classified = BirdTrack String | Blank String | Ordinary String
                 | Line !Int String | CPP String
@@ -35,7 +37,7 @@ classify ('#':s) = case tokens s of
                                   && length file >= 2
                                   && head file == '"'
                                   && last file == '"'
-                                -> Line (read line) (tail (init file))
+                                -> Line (read line) (tail (init file)) -- TODO:eradicateNoParse
                      _          -> CPP s
   where tokens = unfoldr $ \str -> case lex str of
                                    (t@(_:_), str'):_ -> Just (t, str')

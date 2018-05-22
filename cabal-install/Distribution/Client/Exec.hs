@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Exec
@@ -12,9 +11,8 @@
 module Distribution.Client.Exec ( exec
                                 ) where
 
-import Control.Monad (unless)
-
-import Data.Foldable (forM_)
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
 import qualified Distribution.Simple.GHC   as GHC
 import qualified Distribution.Simple.GHCJS as GHCJS
@@ -29,17 +27,14 @@ import Distribution.Simple.Program.Db  (ProgramDb, requireProgram, modifyProgram
 import Distribution.Simple.Program.Find (ProgramSearchPathEntry(..))
 import Distribution.Simple.Program.Run (programInvocation, runProgramInvocation)
 import Distribution.Simple.Program.Types ( simpleProgram, ConfiguredProgram(..) )
-import Distribution.Simple.Utils       (die, warn)
+import Distribution.Simple.Utils       (die', warn)
 
-import Distribution.System    (Platform)
+import Distribution.System    (Platform(..), OS(..), buildOS)
 import Distribution.Verbosity (Verbosity)
 
 import System.Directory ( doesDirectoryExist )
+import System.Environment (lookupEnv)
 import System.FilePath (searchPathSeparator, (</>))
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative ((<$>))
-import Data.Monoid (mempty)
-#endif
 
 
 -- | Execute the given command in the package's environment.
@@ -57,19 +52,19 @@ exec verbosity useSandbox comp platform programDb extraArgs =
     case extraArgs of
         (exe:args) -> do
             program <- requireProgram' verbosity useSandbox programDb exe
-            env <- ((++) (programOverrideEnv program)) <$> environmentOverrides
+            env <- environmentOverrides (programOverrideEnv program)
             let invocation = programInvocation
                                  program { programOverrideEnv = env }
                                  args
             runProgramInvocation verbosity invocation
 
-        [] -> die "Please specify an executable to run"
+        [] -> die' verbosity "Please specify an executable to run"
   where
-    environmentOverrides = 
+    environmentOverrides env =
         case useSandbox of
-            NoSandbox -> return []
+            NoSandbox -> return env
             (UseSandbox sandboxDir) ->
-                sandboxEnvironment verbosity sandboxDir comp platform programDb
+                sandboxEnvironment verbosity sandboxDir comp platform programDb env
 
 
 -- | Return the package's sandbox environment.
@@ -80,35 +75,88 @@ sandboxEnvironment :: Verbosity
                    -> Compiler
                    -> Platform
                    -> ProgramDb
+                   -> [(String, Maybe String)] -- environment overrides so far
                    -> IO [(String, Maybe String)]
-sandboxEnvironment verbosity sandboxDir comp platform programDb =
+sandboxEnvironment verbosity sandboxDir comp platform programDb iEnv =
     case compilerFlavor comp of
       GHC   -> env GHC.getGlobalPackageDB   ghcProgram   "GHC_PACKAGE_PATH"
       GHCJS -> env GHCJS.getGlobalPackageDB ghcjsProgram "GHCJS_PACKAGE_PATH"
-      _     -> die "exec only works with GHC and GHCJS"
+      _     -> die' verbosity "exec only works with GHC and GHCJS"
   where
+    (Platform _ os) = platform
+    ldPath = case os of
+               OSX     -> "DYLD_LIBRARY_PATH"
+               Windows -> "PATH"
+               _       -> "LD_LIBRARY_PATH"
     env getGlobalPackageDB hcProgram packagePathEnvVar = do
         let Just program = lookupProgram hcProgram programDb
         gDb <- getGlobalPackageDB verbosity program
         sandboxConfigFilePath <- getSandboxConfigFilePath mempty
-        let compilerPackagePath = hcPackagePath gDb
+        let sandboxPackagePath   = sandboxPackageDBPath sandboxDir comp platform
+            compilerPackagePaths = prependToSearchPath gDb sandboxPackagePath
         -- Packages database must exist, otherwise things will start
         -- failing in mysterious ways.
-        forM_ compilerPackagePath $ \fp -> do
-          exists <- doesDirectoryExist fp
-          unless exists $ warn verbosity $ "Package database is not a directory: " ++ fp
-        -- Build the environment
-        return [ (packagePathEnvVar, compilerPackagePath)
-               , ("CABAL_SANDBOX_PACKAGE_PATH", compilerPackagePath)
-               , ("CABAL_SANDBOX_CONFIG", Just sandboxConfigFilePath)
-               ]
+        exists <- doesDirectoryExist sandboxPackagePath
+        unless exists $ warn verbosity $ "Package database is not a directory: "
+                                           ++ sandboxPackagePath
+        -- MASSIVE HACK.  We need this to be synchronized with installLibDir
+        -- in defaultInstallDirs' in Distribution.Simple.InstallDirs,
+        -- which has a special case for Windows (WHY? Who knows; it's been
+        -- around as long as Windows exists.)  The sane thing to do here
+        -- would be to read out the actual install dirs that were associated
+        -- with the package in question, but that's not a well-formed question
+        -- here because there is not actually install directory for the
+        -- "entire" sandbox.  Since we want to kill this code in favor of
+        -- new-build, I decided it wasn't worth fixing this "properly."
+        -- Also, this doesn't handle LHC correctly but I don't care -- ezyang
+        let extraLibPath =
+                case buildOS of
+                    Windows -> sandboxDir
+                    _ -> sandboxDir </> "lib"
+        -- 2016-11-26 Apologies for the spaghetti code here.
+        -- Essentially we just want to add the sandbox's lib/ dir to
+        -- whatever the library search path environment variable is:
+        -- this allows running existing executables against foreign
+        -- libraries (meaning Haskell code with a bunch of foreign
+        -- exports). However, on Windows this variable is equal to the
+        -- executable search path env var. And we try to keep not only
+        -- what was already set in the environment, but also the
+        -- additional directories we add below in requireProgram'. So
+        -- the strategy is that we first take the environment
+        -- overrides from requireProgram' below. If the library search
+        -- path env is overridden (e.g. because we're on windows), we
+        -- prepend the lib/ dir to the relevant override. If not, we
+        -- want to avoid wiping the user's own settings, so we first
+        -- read the env var's current value, and then prefix ours if
+        -- the user had any set.
+        iEnv' <-
+          if any ((==ldPath) . fst) iEnv
+            then return $ updateLdPath extraLibPath iEnv
+            else do
+              currentLibraryPath <- lookupEnv ldPath
+              let updatedLdPath =
+                    case currentLibraryPath of
+                      Nothing -> Just extraLibPath
+                      Just paths ->
+                        Just $ extraLibPath ++ [searchPathSeparator] ++ paths
+              return $ (ldPath, updatedLdPath) : iEnv
 
-    hcPackagePath gDb =
-        let s = sandboxPackageDBPath sandboxDir comp platform
-            in Just $ prependToSearchPath gDb s
+        -- Build the environment
+        return $ [ (packagePathEnvVar, Just compilerPackagePaths)
+                 , ("CABAL_SANDBOX_PACKAGE_PATH", Just compilerPackagePaths)
+                 , ("CABAL_SANDBOX_CONFIG", Just sandboxConfigFilePath)
+                 ] ++ iEnv'
 
     prependToSearchPath path newValue =
         newValue ++ [searchPathSeparator] ++ path
+
+    updateLdPath path = map update
+      where
+        update (name, Just current)
+          | name == ldPath = (ldPath, Just $ path ++ [searchPathSeparator] ++ current)
+        update (name, Nothing)
+          | name == ldPath = (ldPath, Just path)
+        update x = x
 
 
 -- | Check that a program is configured and available to be run. If

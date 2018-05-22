@@ -17,36 +17,35 @@ module Distribution.Client.Haddock
     where
 
 import Data.List (maximumBy)
+import Data.Foldable (forM_)
 import System.Directory (createDirectoryIfMissing, renameFile)
 import System.FilePath ((</>), splitFileName)
 import Distribution.Package
          ( packageVersion )
 import Distribution.Simple.Haddock (haddockPackagePaths)
-import Distribution.Simple.Program (haddockProgram, ProgramConfiguration
-                                   , rawSystemProgram, requireProgramVersion)
-import Distribution.Version (Version(Version), orLaterVersion)
+import Distribution.Simple.Program (haddockProgram, ProgramDb
+                                   , runProgram, requireProgramVersion)
+import Distribution.Version (mkVersion, orLaterVersion)
 import Distribution.Verbosity (Verbosity)
 import Distribution.Simple.PackageIndex
          ( InstalledPackageIndex, allPackagesByName )
 import Distribution.Simple.Utils
          ( comparing, debug, installDirectoryContents, withTempDirectory )
 import Distribution.InstalledPackageInfo as InstalledPackageInfo
-         ( InstalledPackageInfo_(exposed) )
+         ( InstalledPackageInfo(exposed) )
 
 regenerateHaddockIndex :: Verbosity
-                       -> InstalledPackageIndex -> ProgramConfiguration
+                       -> InstalledPackageIndex -> ProgramDb
                        -> FilePath
                        -> IO ()
-regenerateHaddockIndex verbosity pkgs conf index = do
+regenerateHaddockIndex verbosity pkgs progdb index = do
       (paths, warns) <- haddockPackagePaths pkgs' Nothing
       let paths' = [ (interface, html) | (interface, Just html) <- paths]
-      case warns of
-        Nothing -> return ()
-        Just m  -> debug verbosity m
+      forM_ warns (debug verbosity)
 
       (confHaddock, _, _) <-
           requireProgramVersion verbosity haddockProgram
-                                    (orLaterVersion (Version [0,6] [])) conf
+                                    (orLaterVersion (mkVersion [0,6])) progdb
 
       createDirectoryIfMissing True destDir
 
@@ -58,7 +57,7 @@ regenerateHaddockIndex verbosity pkgs conf index = do
                     , "--title=Haskell modules on this system" ]
                  ++ [ "--read-interface=" ++ html ++ "," ++ interface
                     | (interface, html) <- paths' ]
-        rawSystemProgram verbosity confHaddock flags
+        runProgram verbosity confHaddock flags
         renameFile (tempDir </> "index.html") (tempDir </> destFile)
         installDirectoryContents verbosity tempDir destDir
 

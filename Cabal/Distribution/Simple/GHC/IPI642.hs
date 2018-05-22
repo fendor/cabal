@@ -11,22 +11,17 @@
 module Distribution.Simple.GHC.IPI642 (
     InstalledPackageInfo(..),
     toCurrent,
-
-    -- Don't use these, they're only for conversion purposes
-    PackageIdentifier, convertPackageId,
-    License, convertLicense,
-    convertModuleName
   ) where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+
 import qualified Distribution.InstalledPackageInfo as Current
-import qualified Distribution.Package as Current hiding (installedPackageId)
-import qualified Distribution.License as Current
-
-import Distribution.Version (Version)
-import Distribution.ModuleName (ModuleName)
-import Distribution.Text (simpleParse,display)
-
-import Data.Maybe
+import qualified Distribution.Types.AbiHash        as Current
+import qualified Distribution.Types.ComponentId    as Current
+import qualified Distribution.Types.UnitId         as Current
+import Distribution.Simple.GHC.IPIConvert
+import Distribution.Text
 
 -- | This is the InstalledPackageInfo type used by ghc-6.4.2 and later.
 --
@@ -70,43 +65,19 @@ data InstalledPackageInfo = InstalledPackageInfo {
   }
   deriving Read
 
-data PackageIdentifier = PackageIdentifier {
-    pkgName    :: String,
-    pkgVersion :: Version
-  }
-  deriving Read
-
-data License = GPL | LGPL | BSD3 | BSD4
-             | PublicDomain | AllRightsReserved | OtherLicense
-  deriving Read
-
-convertPackageId :: PackageIdentifier -> Current.PackageIdentifier
-convertPackageId PackageIdentifier { pkgName = n, pkgVersion = v } =
-  Current.PackageIdentifier (Current.PackageName n) v
-
-mkInstalledPackageId :: Current.PackageIdentifier -> Current.InstalledPackageId
-mkInstalledPackageId = Current.InstalledPackageId . display
-
-convertModuleName :: String -> ModuleName
-convertModuleName s = fromJust $ simpleParse s
-
-convertLicense :: License -> Current.License
-convertLicense GPL  = Current.GPL  Nothing
-convertLicense LGPL = Current.LGPL Nothing
-convertLicense BSD3 = Current.BSD3
-convertLicense BSD4 = Current.BSD4
-convertLicense PublicDomain = Current.PublicDomain
-convertLicense AllRightsReserved = Current.AllRightsReserved
-convertLicense OtherLicense = Current.OtherLicense
-
 toCurrent :: InstalledPackageInfo -> Current.InstalledPackageInfo
 toCurrent ipi@InstalledPackageInfo{} =
-  let pid = convertPackageId (package ipi)
-      mkExposedModule m = Current.ExposedModule m Nothing Nothing
+  let mkExposedModule m = Current.ExposedModule m Nothing
+      pid = convertPackageId (package ipi)
   in Current.InstalledPackageInfo {
-    Current.installedPackageId = mkInstalledPackageId (convertPackageId (package ipi)),
     Current.sourcePackageId    = pid,
-    Current.packageKey         = Current.OldPackageKey pid,
+    Current.installedUnitId    = Current.mkLegacyUnitId pid,
+    Current.installedComponentId_ = Current.mkComponentId (display pid),
+    Current.instantiatedWith   = [],
+    -- Internal libraries not supported!
+    Current.sourceLibName      = Nothing,
+    Current.compatPackageKey   = "",
+    Current.abiHash            = Current.mkAbiHash "", -- bogus but old GHCs don't care.
     Current.license            = convertLicense (license ipi),
     Current.copyright          = copyright ipi,
     Current.maintainer         = maintainer ipi,
@@ -117,20 +88,22 @@ toCurrent ipi@InstalledPackageInfo{} =
     Current.synopsis           = "",
     Current.description        = description ipi,
     Current.category           = category ipi,
+    Current.indefinite         = False,
     Current.exposed            = exposed ipi,
     Current.exposedModules     = map (mkExposedModule . convertModuleName) (exposedModules ipi),
     Current.hiddenModules      = map convertModuleName (hiddenModules ipi),
-    Current.instantiatedWith   = [],
     Current.trusted            = Current.trusted Current.emptyInstalledPackageInfo,
     Current.importDirs         = importDirs ipi,
     Current.libraryDirs        = libraryDirs ipi,
+    Current.libraryDynDirs     = [],
     Current.dataDir            = "",
     Current.hsLibraries        = hsLibraries ipi,
     Current.extraLibraries     = extraLibraries ipi,
     Current.extraGHCiLibraries = extraGHCiLibraries ipi,
     Current.includeDirs        = includeDirs ipi,
     Current.includes           = includes ipi,
-    Current.depends            = map (mkInstalledPackageId.convertPackageId) (depends ipi),
+    Current.depends            = map (Current.mkLegacyUnitId . convertPackageId) (depends ipi),
+    Current.abiDepends         = [],
     Current.ccOptions          = ccOptions ipi,
     Current.ldOptions          = ldOptions ipi,
     Current.frameworkDirs      = frameworkDirs ipi,

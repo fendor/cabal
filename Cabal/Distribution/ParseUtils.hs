@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.ParseUtils
@@ -20,6 +19,7 @@
 -- This module is meant to be local-only to Distribution...
 
 {-# OPTIONS_HADDOCK hide #-}
+{-# LANGUAGE Rank2Types #-}
 module Distribution.ParseUtils (
         LineNo, PError(..), PWarning(..), locatedErrorMsg, syntaxError, warning,
         runP, runE, ParseResult(..), catchParseError, parseFail, showPWarning,
@@ -28,50 +28,49 @@ module Distribution.ParseUtils (
         showFields, showSingleNamedField, showSimpleSingleNamedField,
         parseFields, parseFieldsFlat,
         parseFilePathQ, parseTokenQ, parseTokenQ',
-        parseModuleNameQ, parseBuildTool, parsePkgconfigDependency,
-        parseOptVersion, parsePackageNameQ, parseVersionRangeQ,
+        parseModuleNameQ,
+        parseOptVersion, parsePackageName,
         parseTestedWithQ, parseLicenseQ, parseLanguageQ, parseExtensionQ,
         parseSepList, parseCommaList, parseOptCommaList,
         showFilePath, showToken, showTestedWith, showFreeText, parseFreeText,
         field, simpleField, listField, listFieldWithSep, spaceListField,
         commaListField, commaListFieldWithSep, commaNewLineListField,
-        optsField, liftField, boolField, parseQuoted, indentWith,
+        optsField, liftField, boolField, parseQuoted, parseMaybeQuoted, indentWith,
+        readPToMaybe,
 
         UnrecFieldParser, warnUnrec, ignoreUnrec,
   ) where
 
-import Distribution.Compiler (CompilerFlavor, parseCompilerFlavorCompat)
+import Prelude ()
+import Distribution.Compat.Prelude hiding (get)
+
+import Distribution.Compiler
 import Distribution.License
 import Distribution.Version
-         ( Version(..), VersionRange, anyVersion )
-import Distribution.Package     ( PackageName(..), Dependency(..) )
-import Distribution.ModuleName (ModuleName)
+import Distribution.ModuleName
+import qualified Distribution.Compat.MonadFail as Fail
 import Distribution.Compat.ReadP as ReadP hiding (get)
 import Distribution.ReadE
+import Distribution.Compat.Newtype
+import Distribution.Parsec.Newtypes (TestedWith (..))
 import Distribution.Text
-         ( Text(..) )
-import Distribution.Simple.Utils
-         ( comparing, dropWhileEndLE, intercalate, lowercase
-         , normaliseLineEndings )
+import Distribution.Utils.Generic
+import Distribution.Pretty
 import Language.Haskell.Extension
-         ( Language, Extension )
 
-import Text.PrettyPrint hiding (braces)
-import Data.Char (isSpace, toLower, isAlphaNum, isDigit)
-import Data.Maybe       (fromMaybe)
+import Text.PrettyPrint
+    ( Doc, render, style, renderStyle
+    , text, colon, nest, punctuate, comma, sep
+    , fsep, hsep, isEmpty, vcat, mode, Mode (..)
+    , ($+$), (<+>)
+    )
 import Data.Tree as Tree (Tree(..), flatten)
 import qualified Data.Map as Map
-import Control.Monad (foldM, ap)
-#if __GLASGOW_HASKELL__ < 710
-import Control.Applicative (Applicative(..))
-#endif
 import System.FilePath (normalise)
-import Data.List (sortBy)
 
 -- -----------------------------------------------------------------------------
 
 type LineNo    = Int
-type Separator = ([Doc] -> Doc)
 
 data PError = AmbiguousParse String LineNo
             | NoParse String LineNo
@@ -98,16 +97,19 @@ instance Functor ParseResult where
         fmap f (ParseOk ws x) = ParseOk ws $ f x
 
 instance Applicative ParseResult where
-        pure = return
+        pure = ParseOk []
         (<*>) = ap
 
 
 instance Monad ParseResult where
-        return = ParseOk []
+        return = pure
         ParseFailed err >>= _ = ParseFailed err
         ParseOk ws x >>= f = case f x of
                                ParseFailed err -> ParseFailed err
                                ParseOk ws' x' -> ParseOk (ws'++ws) x'
+        fail = Fail.fail
+
+instance Fail.MonadFail ParseResult where
         fail s = ParseFailed (FromString s Nothing)
 
 catchParseError :: ParseResult a -> (PError -> ParseResult a)
@@ -272,9 +274,9 @@ ppFields fields x =
 
 ppField :: String -> Doc -> Doc
 ppField name fielddoc
-   | isEmpty fielddoc         = empty
-   | name `elem` nestedFields = text name <> colon $+$ nest indentWith fielddoc
-   | otherwise                = text name <> colon <+> fielddoc
+   | isEmpty fielddoc         = mempty
+   | name `elem` nestedFields = text name <<>> colon $+$ nest indentWith fielddoc
+   | otherwise                = text name <<>> colon <+> fielddoc
    where
       nestedFields =
          [ "description"
@@ -283,12 +285,15 @@ ppField name fielddoc
          , "extra-source-files"
          , "extra-tmp-files"
          , "exposed-modules"
+         , "asm-sources"
+         , "cmm-sources"
          , "c-sources"
          , "js-sources"
          , "extra-libraries"
          , "includes"
          , "install-includes"
          , "other-modules"
+         , "autogen-modules"
          , "depends"
          ]
 
@@ -388,14 +393,14 @@ fName _ = error "fname: not a field or section"
 
 readFields :: String -> ParseResult [Field]
 readFields input = ifelse
-               =<< mapM (mkField 0)
+               =<< traverse (mkField 0)
                =<< mkTree tokens
 
   where ls = (lines . normaliseLineEndings) input
         tokens = (concatMap tokeniseLine . trimLines) ls
 
 readFieldsFlat :: String -> ParseResult [Field]
-readFieldsFlat input = mapM (mkField 0)
+readFieldsFlat input = traverse (mkField 0)
                    =<< mkTree tokens
   where ls = (lines . normaliseLineEndings) input
         tokens = (concatMap tokeniseLineFlat . trimLines) ls
@@ -569,7 +574,7 @@ mkField d (Node (n,_,l) ts) = case span (\c -> isAlphaNum c || c == '-') l of
                         then tabsError n
                         else return $ F n (map toLower name)
                                           (fieldValue rest' followingLines)
-    rest'       -> do ts' <- mapM (mkField (d+1)) ts
+    rest'       -> do ts' <- traverse (mkField (d+1)) ts
                       return (Section n (map toLower name) rest' ts')
  where    fieldValue firstLine followingLines =
             let firstLine' = trimLeading firstLine
@@ -611,7 +616,7 @@ ifelse (f:fs) = do fs' <- ifelse fs
 
 -- |parse a module name
 parseModuleNameQ :: ReadP r ModuleName
-parseModuleNameQ = parseQuoted parse <++ parse
+parseModuleNameQ = parseMaybeQuoted parse
 
 parseFilePathQ :: ReadP r FilePath
 parseFilePathQ = parseTokenQ
@@ -624,47 +629,24 @@ betweenSpaces act = do skipSpaces
                        skipSpaces
                        return res
 
-parseBuildTool :: ReadP r Dependency
-parseBuildTool = do name <- parseBuildToolNameQ
-                    ver <- betweenSpaces $
-                           parseVersionRangeQ <++ return anyVersion
-                    return $ Dependency name ver
-
-parseBuildToolNameQ :: ReadP r PackageName
-parseBuildToolNameQ = parseQuoted parseBuildToolName <++ parseBuildToolName
-
--- like parsePackageName but accepts symbols in components
-parseBuildToolName :: ReadP r PackageName
-parseBuildToolName = do ns <- sepBy1 component (ReadP.char '-')
-                        return (PackageName (intercalate "-" ns))
-  where component = do
-          cs <- munch1 (\c -> isAlphaNum c || c == '+' || c == '_')
-          if all isDigit cs then pfail else return cs
-
--- pkg-config allows versions and other letters in package names,
--- eg "gtk+-2.0" is a valid pkg-config package _name_.
--- It then has a package version number like 2.10.13
-parsePkgconfigDependency :: ReadP r Dependency
-parsePkgconfigDependency = do name <- munch1
-                                      (\c -> isAlphaNum c || c `elem` "+-._")
-                              ver <- betweenSpaces $
-                                     parseVersionRangeQ <++ return anyVersion
-                              return $ Dependency (PackageName name) ver
-
-parsePackageNameQ :: ReadP r PackageName
-parsePackageNameQ = parseQuoted parse <++ parse
-
-parseVersionRangeQ :: ReadP r VersionRange
-parseVersionRangeQ = parseQuoted parse <++ parse
+parsePackageName :: ReadP r String
+parsePackageName = do
+  ns <- sepBy1 component (char '-')
+  return $ intercalate "-" ns
+  where
+    component = do
+      cs <- munch1 isAlphaNum
+      if all isDigit cs then pfail else return cs
+      -- each component must contain an alphabetic character, to avoid
+      -- ambiguity in identifiers like foo-1 (the 1 is the version number).
 
 parseOptVersion :: ReadP r Version
-parseOptVersion = parseQuoted ver <++ ver
+parseOptVersion = parseMaybeQuoted ver
   where ver :: ReadP r Version
-        ver = parse <++ return noVersion
-        noVersion = Version [] []
+        ver = parse <++ return nullVersion
 
 parseTestedWithQ :: ReadP r (CompilerFlavor,VersionRange)
-parseTestedWithQ = parseQuoted tw <++ tw
+parseTestedWithQ = parseMaybeQuoted tw
   where
     tw :: ReadP r (CompilerFlavor,VersionRange)
     tw = do compiler <- parseCompilerFlavorCompat
@@ -672,7 +654,7 @@ parseTestedWithQ = parseQuoted tw <++ tw
             return (compiler,version)
 
 parseLicenseQ :: ReadP r License
-parseLicenseQ = parseQuoted parse <++ parse
+parseLicenseQ = parseMaybeQuoted parse
 
 -- urgh, we can't define optQuotes :: ReadP r a -> ReadP r a
 -- because the "compat" version of ReadP isn't quite powerful enough.  In
@@ -680,10 +662,10 @@ parseLicenseQ = parseQuoted parse <++ parse
 -- Hence the trick above to make 'lic' polymorphic.
 
 parseLanguageQ :: ReadP r Language
-parseLanguageQ = parseQuoted parse <++ parse
+parseLanguageQ = parseMaybeQuoted parse
 
 parseExtensionQ :: ReadP r Extension
-parseExtensionQ = parseQuoted parse <++ parse
+parseExtensionQ = parseMaybeQuoted parse
 
 parseHaskellString :: ReadP r String
 parseHaskellString = readS_to_P reads
@@ -715,41 +697,19 @@ parseOptCommaList = parseSepList (optional (ReadP.char ','))
 parseQuoted :: ReadP r a -> ReadP r a
 parseQuoted = between (ReadP.char '"') (ReadP.char '"')
 
+parseMaybeQuoted :: (forall r. ReadP r a) -> ReadP r' a
+parseMaybeQuoted p = parseQuoted p <++ p
+
 parseFreeText :: ReadP.ReadP s String
 parseFreeText = ReadP.munch (const True)
 
--- --------------------------------------------
--- ** Pretty printing
+readPToMaybe :: ReadP a a -> String -> Maybe a
+readPToMaybe p str = listToMaybe [ r | (r,s) <- readP_to_S p str
+                                     , all isSpace s ]
 
-showFilePath :: FilePath -> Doc
-showFilePath "" = empty
-showFilePath x  = showToken x
+-------------------------------------------------------------------------------
+-- Internal
+-------------------------------------------------------------------------------
 
-showToken :: String -> Doc
-showToken str
- | not (any dodgy str) &&
-   not (null str)       = text str
- | otherwise            = text (show str)
-  where dodgy c = isSpace c || c == ','
-
-showTestedWith :: (CompilerFlavor,VersionRange) -> Doc
-showTestedWith (compiler, version) = text (show compiler) <+> disp version
-
--- | Pretty-print free-format text, ensuring that it is vertically aligned,
--- and with blank lines replaced by dots for correct re-parsing.
-showFreeText :: String -> Doc
-showFreeText "" = empty
-showFreeText s  = vcat [text (if null l then "." else l) | l <- lines_ s]
-
--- | 'lines_' breaks a string up into a list of strings at newline
--- characters.  The resulting strings do not contain newlines.
-lines_                   :: String -> [String]
-lines_ []                =  [""]
-lines_ s                 =  let (l, s') = break (== '\n') s
-                            in  l : case s' of
-                                        []    -> []
-                                        (_:s'') -> lines_ s''
-
--- | the indentation used for pretty printing
-indentWith :: Int
-indentWith = 4
+showTestedWith :: (CompilerFlavor, VersionRange) -> Doc
+showTestedWith = pretty . pack' TestedWith

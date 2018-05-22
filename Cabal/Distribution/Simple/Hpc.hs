@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Hpc
@@ -21,7 +24,10 @@ module Distribution.Simple.Hpc
     , markupTest
     ) where
 
-import Control.Monad ( when )
+import Prelude ()
+import Distribution.Compat.Prelude
+
+import Distribution.Types.UnqualComponentName
 import Distribution.ModuleName ( main )
 import Distribution.PackageDescription
     ( TestSuite(..)
@@ -96,22 +102,23 @@ markupTest :: Verbosity
            -> TestSuite
            -> IO ()
 markupTest verbosity lbi distPref libName suite = do
-    tixFileExists <- doesFileExist $ tixFilePath distPref way $ testName suite
+    tixFileExists <- doesFileExist $ tixFilePath distPref way $ testName'
     when tixFileExists $ do
         -- behaviour of 'markup' depends on version, so we need *a* version
         -- but no particular one
         (hpc, hpcVer, _) <- requireProgramVersion verbosity
             hpcProgram anyVersion (withPrograms lbi)
-        let htmlDir_ = htmlDir distPref way $ testName suite
+        let htmlDir_ = htmlDir distPref way testName'
         markup hpc hpcVer verbosity
-            (tixFilePath distPref way $ testName suite) mixDirs
+            (tixFilePath distPref way testName') mixDirs
             htmlDir_
             (testModules suite ++ [ main ])
         notice verbosity $ "Test coverage report written to "
                             ++ htmlDir_ </> "hpc_index" <.> "html"
   where
     way = guessWay lbi
-    mixDirs = map (mixDir distPref way) [ testName suite, libName ]
+    testName' = unUnqualComponentName $ testName suite
+    mixDirs = map (mixDir distPref way) [ testName', libName ]
 
 -- | Generate the HTML markup for all of a package's test suites.
 markupPackage :: Verbosity
@@ -121,8 +128,8 @@ markupPackage :: Verbosity
               -> [TestSuite]
               -> IO ()
 markupPackage verbosity lbi distPref libName suites = do
-    let tixFiles = map (tixFilePath distPref way . testName) suites
-    tixFilesExist <- mapM doesFileExist tixFiles
+    let tixFiles = map (tixFilePath distPref way) testNames
+    tixFilesExist <- traverse doesFileExist tixFiles
     when (and tixFilesExist) $ do
         -- behaviour of 'markup' depends on version, so we need *a* version
         -- but no particular one
@@ -138,4 +145,5 @@ markupPackage verbosity lbi distPref libName suites = do
                            ++ htmlDir' </> "hpc_index.html"
   where
     way = guessWay lbi
-    mixDirs = map (mixDir distPref way) $ libName : map testName suites
+    testNames = fmap (unUnqualComponentName . testName) suites
+    mixDirs = map (mixDir distPref way) $ libName : testNames

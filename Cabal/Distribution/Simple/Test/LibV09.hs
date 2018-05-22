@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Distribution.Simple.Test.LibV09
        ( runTest
          -- Test stub
@@ -6,48 +9,49 @@ module Distribution.Simple.Test.LibV09
        , writeSimpleTestStub
        ) where
 
-import Distribution.Compat.CreatePipe ( createPipe )
-import Distribution.Compat.Environment ( getEnvironment )
-import Distribution.Compat.TempFile ( openTempFile )
-import Distribution.ModuleName ( ModuleName )
+import Prelude ()
+import Distribution.Compat.Prelude
+import Distribution.Types.UnqualComponentName
+
+import Distribution.Compat.CreatePipe
+import Distribution.Compat.Environment
+import Distribution.Compat.Internal.TempFile
+import Distribution.ModuleName
 import qualified Distribution.PackageDescription as PD
-import Distribution.Simple.Build.PathsModule ( pkgPathEnvVar )
-import Distribution.Simple.BuildPaths ( exeExtension )
-import Distribution.Simple.Compiler ( compilerInfo )
-import Distribution.Simple.Hpc ( guessWay, markupTest, tixDir, tixFilePath )
+import Distribution.Simple.Build.PathsModule
+import Distribution.Simple.BuildPaths
+import Distribution.Simple.Compiler
+import Distribution.Simple.Hpc
 import Distribution.Simple.InstallDirs
-    ( fromPathTemplate, initialPathTemplateEnv, PathTemplateVariable(..)
-    , substPathTemplate , toPathTemplate, PathTemplate )
 import qualified Distribution.Simple.LocalBuildInfo as LBI
+import qualified Distribution.Types.LocalBuildInfo as LBI
 import Distribution.Simple.Setup
-    ( TestFlags(..), TestShowDetails(..), fromFlag, configCoverage )
 import Distribution.Simple.Test.Log
 import Distribution.Simple.Utils
-    ( die, notice, rawSystemIOWithEnv, addLibraryPath )
-import Distribution.System ( Platform (..) )
+import Distribution.System
 import Distribution.TestSuite
 import Distribution.Text
-import Distribution.Verbosity ( normal )
+import Distribution.Verbosity
 
-import Control.Concurrent (forkIO)
-import Control.Exception ( bracket )
-import Control.Monad ( when, unless, void )
-import Data.Maybe ( mapMaybe )
+import qualified Control.Exception as CE
 import System.Directory
-    ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+    ( createDirectoryIfMissing, canonicalizePath
+    , doesDirectoryExist, doesFileExist
     , getCurrentDirectory, removeDirectoryRecursive, removeFile
     , setCurrentDirectory )
-import System.Exit ( ExitCode(..), exitWith )
+import System.Exit ( exitSuccess, exitWith, ExitCode(..) )
 import System.FilePath ( (</>), (<.>) )
 import System.IO ( hClose, hGetContents, hPutStr )
+import System.Process (StdStream(..), waitForProcess)
 
 runTest :: PD.PackageDescription
         -> LBI.LocalBuildInfo
+        -> LBI.ComponentLocalBuildInfo
         -> TestFlags
         -> PD.TestSuite
         -> IO TestSuiteLog
-runTest pkg_descr lbi flags suite = do
-    let isCoverageEnabled = fromFlag $ configCoverage $ LBI.configFlags lbi
+runTest pkg_descr lbi clbi flags suite = do
+    let isCoverageEnabled = LBI.testCoverage lbi
         way = guessWay lbi
 
     pwd <- getCurrentDirectory
@@ -57,28 +61,48 @@ runTest pkg_descr lbi flags suite = do
                   </> stubName suite <.> exeExtension
     -- Check that the test executable exists.
     exists <- doesFileExist cmd
-    unless exists $ die $ "Error: Could not find test program \"" ++ cmd
-                          ++ "\". Did you build the package first?"
+    unless exists $
+      die' verbosity $ "Error: Could not find test program \"" ++ cmd
+                    ++ "\". Did you build the package first?"
 
     -- Remove old .tix files if appropriate.
     unless (fromFlag $ testKeepTix flags) $ do
-        let tDir = tixDir distPref way $ PD.testName suite
+        let tDir = tixDir distPref way testName'
         exists' <- doesDirectoryExist tDir
         when exists' $ removeDirectoryRecursive tDir
 
     -- Create directory for HPC files.
-    createDirectoryIfMissing True $ tixDir distPref way $ PD.testName suite
+    createDirectoryIfMissing True $ tixDir distPref way testName'
 
     -- Write summary notices indicating start of test suite
-    notice verbosity $ summarizeSuiteStart $ PD.testName suite
+    notice verbosity $ summarizeSuiteStart testName'
 
-    suiteLog <- bracket openCabalTemp deleteIfExists $ \tempLog -> do
+    suiteLog <- CE.bracket openCabalTemp deleteIfExists $ \tempLog -> do
 
-        (rIn, wIn) <- createPipe
         (rOut, wOut) <- createPipe
 
-        -- Prepare standard input for test executable
-        --appendFile tempInput $ show (tempInput, PD.testName suite)
+        -- Run test executable
+        (Just wIn, _, _, process) <- do
+                let opts = map (testOption pkg_descr lbi suite) $ testOptions flags
+                    dataDirPath = pwd </> PD.dataDir pkg_descr
+                    tixFile = pwd </> tixFilePath distPref way testName'
+                    pkgPathEnv = (pkgPathEnvVar pkg_descr "datadir", dataDirPath)
+                               : existingEnv
+                    shellEnv = [("HPCTIXFILE", tixFile) | isCoverageEnabled]
+                             ++ pkgPathEnv
+                -- Add (DY)LD_LIBRARY_PATH if needed
+                shellEnv' <-
+                  if LBI.withDynExe lbi
+                  then do
+                    let (Platform _ os) = LBI.hostPlatform lbi
+                    paths <- LBI.depLibraryPaths True False lbi clbi
+                    cpath <- canonicalizePath $ LBI.componentBuildDir lbi clbi
+                    return (addLibraryPath os (cpath : paths) shellEnv)
+                  else return shellEnv
+                createProcessWithEnv verbosity cmd opts Nothing (Just shellEnv')
+                                     -- these handles are closed automatically
+                                     CreatePipe (UseHandle wOut) (UseHandle wOut)
+
         hPutStr wIn $ show (tempLog, PD.testName suite)
         hClose wIn
 
@@ -86,44 +110,24 @@ runTest pkg_descr lbi flags suite = do
         -- readable log file
         logText <- hGetContents rOut
         -- Force the IO manager to drain the test output pipe
-        void $ forkIO $ length logText `seq` return ()
+        length logText `seq` return ()
 
-        -- Run test executable
-        _ <- do let opts = map (testOption pkg_descr lbi suite) $ testOptions flags
-                    dataDirPath = pwd </> PD.dataDir pkg_descr
-                    tixFile = pwd </> tixFilePath distPref way (PD.testName suite)
-                    pkgPathEnv = (pkgPathEnvVar pkg_descr "datadir", dataDirPath)
-                               : existingEnv
-                    shellEnv = [("HPCTIXFILE", tixFile) | isCoverageEnabled]
-                             ++ pkgPathEnv
-                -- Add (DY)LD_LIBRARY_PATH if needed
-                shellEnv' <- if LBI.withDynExe lbi
-                                then do
-                                  let (Platform _ os) = LBI.hostPlatform lbi
-                                      clbi = LBI.getComponentLocalBuildInfo
-                                                   lbi
-                                                   (LBI.CTestName
-                                                      (PD.testName suite))
-                                  paths <- LBI.depLibraryPaths
-                                             True False lbi clbi
-                                  return (addLibraryPath os paths shellEnv)
-                                else return shellEnv
-                rawSystemIOWithEnv verbosity cmd opts Nothing (Just shellEnv')
-                                   -- these handles are closed automatically
-                                   (Just rIn) (Just wOut) (Just wOut)
+        exitcode <- waitForProcess process
+        unless (exitcode == ExitSuccess) $ do
+            debug verbosity $ cmd ++ " returned " ++ show exitcode
 
         -- Generate final log file name
         let finalLogName l = testLogDir
                              </> testSuiteLogPath
                                  (fromFlag $ testHumanLog flags) pkg_descr lbi
-                                 (testSuiteName l) (testLogs l)
+                                 (unUnqualComponentName $ testSuiteName l) (testLogs l)
         -- Generate TestSuiteLog from executable exit code and a machine-
         -- readable test log
-        suiteLog <- fmap ((\l -> l { logFile = finalLogName l }) . read)
+        suiteLog <- fmap ((\l -> l { logFile = finalLogName l }) . read) -- TODO: eradicateNoParse
                     $ readFile tempLog
 
         -- Write summary notice to log file indicating start of test suite
-        appendFile (logFile suiteLog) $ summarizeSuiteStart $ PD.testName suite
+        appendFile (logFile suiteLog) $ summarizeSuiteStart testName'
 
         appendFile (logFile suiteLog) logText
 
@@ -148,6 +152,8 @@ runTest pkg_descr lbi flags suite = do
 
     return suiteLog
   where
+    testName' = unUnqualComponentName $ PD.testName suite
+    
     deleteIfExists file = do
         exists <- doesFileExist file
         when exists $ removeFile file
@@ -171,15 +177,15 @@ testOption pkg_descr lbi suite template =
     fromPathTemplate $ substPathTemplate env template
   where
     env = initialPathTemplateEnv
-          (PD.package pkg_descr) (LBI.localLibraryName lbi)
+          (PD.package pkg_descr) (LBI.localUnitId lbi)
           (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi) ++
-          [(TestSuiteNameVar, toPathTemplate $ PD.testName suite)]
+          [(TestSuiteNameVar, toPathTemplate $ unUnqualComponentName $ PD.testName suite)]
 
 -- Test stub ----------
 
 -- | The name of the stub executable associated with a library 'TestSuite'.
 stubName :: PD.TestSuite -> FilePath
-stubName t = PD.testName t ++ "Stub"
+stubName t = unUnqualComponentName (PD.testName t) ++ "Stub"
 
 -- | The filename of the source file for the stub executable associated with a
 -- library 'TestSuite'.
@@ -191,7 +197,7 @@ writeSimpleTestStub :: PD.TestSuite -- ^ library 'TestSuite' for which a stub
                                     -- is being created
                     -> FilePath     -- ^ path to directory where stub source
                                     -- should be located
-                    -> IO ()
+                    -> NoCallStackIO ()
 writeSimpleTestStub t dir = do
     createDirectoryIfMissing True dir
     let filename = dir </> stubFilePath t
@@ -213,11 +219,18 @@ simpleTestStub m = unlines
 -- of detectable errors when Cabal is compiled.
 stubMain :: IO [Test] -> IO ()
 stubMain tests = do
-    (f, n) <- fmap read getContents
+    (f, n) <- fmap read getContents -- TODO: eradicateNoParse
     dir <- getCurrentDirectory
-    results <- tests >>= stubRunTests
+    results <- (tests >>= stubRunTests) `CE.catch` errHandler
     setCurrentDirectory dir
     stubWriteLog f n results
+  where
+    errHandler :: CE.SomeException -> NoCallStackIO TestLogs
+    errHandler e = case CE.fromException e of
+        Just CE.UserInterrupt -> CE.throwIO e
+        _ -> return $ TestLog { testName = "Cabal test suite exception",
+                                testOptionsReturned = [],
+                                testResult = Error $ show e }
 
 -- | The test runner used in library "TestSuite" stub executables.  Runs a list
 -- of 'Test's.  An executable calling this function is meant to be invoked as
@@ -228,7 +241,7 @@ stubMain tests = do
 -- by the calling Cabal process.
 stubRunTests :: [Test] -> IO TestLogs
 stubRunTests tests = do
-    logs <- mapM stubRunTests' tests
+    logs <- traverse stubRunTests' tests
     return $ GroupLogs "Default" logs
   where
     stubRunTests' (Test t) = do
@@ -244,7 +257,7 @@ stubRunTests tests = do
                 }
         finish (Progress _ next) = next >>= finish
     stubRunTests' g@(Group {}) = do
-        logs <- mapM stubRunTests' $ groupTests g
+        logs <- traverse stubRunTests' $ groupTests g
         return $ GroupLogs (groupName g) logs
     stubRunTests' (ExtraOptions _ t) = stubRunTests' t
     maybeDefaultOption opt =
@@ -253,10 +266,10 @@ stubRunTests tests = do
 
 -- | From a test stub, write the 'TestSuiteLog' to temporary file for the calling
 -- Cabal process to read.
-stubWriteLog :: FilePath -> String -> TestLogs -> IO ()
+stubWriteLog :: FilePath -> UnqualComponentName -> TestLogs -> NoCallStackIO ()
 stubWriteLog f n logs = do
     let testLog = TestSuiteLog { testSuiteName = n, testLogs = logs, logFile = f }
     writeFile (logFile testLog) $ show testLog
     when (suiteError logs) $ exitWith $ ExitFailure 2
     when (suiteFailed logs) $ exitWith $ ExitFailure 1
-    exitWith ExitSuccess
+    exitSuccess

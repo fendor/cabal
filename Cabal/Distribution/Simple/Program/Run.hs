@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Program.Run
@@ -19,27 +22,23 @@ module Distribution.Simple.Program.Run (
 
     runProgramInvocation,
     getProgramInvocationOutput,
+    getProgramInvocationOutputAndErrors,
 
     getEffectiveEnvironment,
   ) where
 
-import Distribution.Simple.Program.Types
-         ( ConfiguredProgram(..), programPath )
-import Distribution.Simple.Utils
-         ( die, rawSystemExit, rawSystemIOWithEnv, rawSystemStdInOut
-         , toUTF8, fromUTF8, normaliseLineEndings )
-import Distribution.Verbosity
-         ( Verbosity )
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Data.List
-         ( foldl', unfoldr )
+import Distribution.Simple.Program.Types
+import Distribution.Simple.Utils
+import Distribution.Verbosity
+import Distribution.Compat.Environment
+
 import qualified Data.Map as Map
-import Control.Monad
-         ( when )
+import System.FilePath
 import System.Exit
          ( ExitCode(..), exitWith )
-import Distribution.Compat.Environment
-         ( getEnvironment )
 
 -- | Represents a specific invocation of a specific program.
 --
@@ -52,6 +51,8 @@ data ProgramInvocation = ProgramInvocation {
        progInvokePath  :: FilePath,
        progInvokeArgs  :: [String],
        progInvokeEnv   :: [(String, Maybe String)],
+       -- Extra paths to add to PATH
+       progInvokePathEnv :: [FilePath],
        progInvokeCwd   :: Maybe FilePath,
        progInvokeInput :: Maybe String,
        progInvokeInputEncoding  :: IOEncoding,
@@ -61,12 +62,17 @@ data ProgramInvocation = ProgramInvocation {
 data IOEncoding = IOEncodingText   -- locale mode text
                 | IOEncodingUTF8   -- always utf8
 
+encodeToIOData :: IOEncoding -> String -> IOData
+encodeToIOData IOEncodingText = IODataText
+encodeToIOData IOEncodingUTF8 = IODataBinary . toUTF8LBS
+
 emptyProgramInvocation :: ProgramInvocation
 emptyProgramInvocation =
   ProgramInvocation {
     progInvokePath  = "",
     progInvokeArgs  = [],
     progInvokeEnv   = [],
+    progInvokePathEnv = [],
     progInvokeCwd   = Nothing,
     progInvokeInput = Nothing,
     progInvokeInputEncoding  = IOEncodingText,
@@ -97,6 +103,7 @@ runProgramInvocation verbosity
     progInvokePath  = path,
     progInvokeArgs  = args,
     progInvokeEnv   = [],
+    progInvokePathEnv = [],
     progInvokeCwd   = Nothing,
     progInvokeInput = Nothing
   } =
@@ -107,10 +114,12 @@ runProgramInvocation verbosity
     progInvokePath  = path,
     progInvokeArgs  = args,
     progInvokeEnv   = envOverrides,
+    progInvokePathEnv = extraPath,
     progInvokeCwd   = mcwd,
     progInvokeInput = Nothing
   } = do
-    menv <- getEffectiveEnvironment envOverrides
+    pathOverride <- getExtraPathEnv envOverrides extraPath
+    menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
     exitCode <- rawSystemIOWithEnv verbosity
                                    path args
                                    mcwd menv
@@ -123,59 +132,76 @@ runProgramInvocation verbosity
     progInvokePath  = path,
     progInvokeArgs  = args,
     progInvokeEnv   = envOverrides,
+    progInvokePathEnv = extraPath,
     progInvokeCwd   = mcwd,
     progInvokeInput = Just inputStr,
     progInvokeInputEncoding = encoding
   } = do
-    menv <- getEffectiveEnvironment envOverrides
+    pathOverride <- getExtraPathEnv envOverrides extraPath
+    menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
     (_, errors, exitCode) <- rawSystemStdInOut verbosity
                                     path args
                                     mcwd menv
-                                    (Just input) True
+                                    (Just input) IODataModeBinary
     when (exitCode /= ExitSuccess) $
-      die $ "'" ++ path ++ "' exited with an error:\n" ++ errors
+      die' verbosity $ "'" ++ path ++ "' exited with an error:\n" ++ errors
   where
-    input = case encoding of
-              IOEncodingText -> (inputStr, False)
-              IOEncodingUTF8 -> (toUTF8 inputStr, True) -- use binary mode for
-                                                        -- utf8
-
+    input = encodeToIOData encoding inputStr
 
 getProgramInvocationOutput :: Verbosity -> ProgramInvocation -> IO String
-getProgramInvocationOutput verbosity
+getProgramInvocationOutput verbosity inv = do
+    (output, errors, exitCode) <- getProgramInvocationOutputAndErrors verbosity inv
+    when (exitCode /= ExitSuccess) $
+      die' verbosity $ "'" ++ progInvokePath inv ++ "' exited with an error:\n" ++ errors
+    return output
+
+
+getProgramInvocationOutputAndErrors :: Verbosity -> ProgramInvocation
+                                    -> IO (String, String, ExitCode)
+getProgramInvocationOutputAndErrors verbosity
   ProgramInvocation {
     progInvokePath  = path,
     progInvokeArgs  = args,
     progInvokeEnv   = envOverrides,
+    progInvokePathEnv = extraPath,
     progInvokeCwd   = mcwd,
     progInvokeInput = minputStr,
     progInvokeOutputEncoding = encoding
   } = do
-    let utf8 = case encoding of IOEncodingUTF8 -> True; _ -> False
-        decode | utf8      = fromUTF8 . normaliseLineEndings
-               | otherwise = id
-    menv <- getEffectiveEnvironment envOverrides
+    let mode = case encoding of IOEncodingUTF8 -> IODataModeBinary
+                                IOEncodingText -> IODataModeText
+
+        decode (IODataBinary b) = normaliseLineEndings (fromUTF8LBS b)
+        decode (IODataText   s) = s
+
+    pathOverride <- getExtraPathEnv envOverrides extraPath
+    menv <- getEffectiveEnvironment (envOverrides ++ pathOverride)
     (output, errors, exitCode) <- rawSystemStdInOut verbosity
                                     path args
                                     mcwd menv
-                                    input utf8
-    when (exitCode /= ExitSuccess) $
-      die $ "'" ++ path ++ "' exited with an error:\n" ++ errors
-    return (decode output)
+                                    input mode
+    return (decode output, errors, exitCode)
   where
-    input =
-      case minputStr of
-        Nothing       -> Nothing
-        Just inputStr -> Just $
-          case encoding of
-            IOEncodingText -> (inputStr, False)
-            IOEncodingUTF8 -> (toUTF8 inputStr, True) -- use binary mode for utf8
+    input = encodeToIOData encoding <$> minputStr
 
+getExtraPathEnv :: [(String, Maybe String)] -> [FilePath] -> NoCallStackIO [(String, Maybe String)]
+getExtraPathEnv _ [] = return []
+getExtraPathEnv env extras = do
+    mb_path <- case lookup "PATH" env of
+                Just x  -> return x
+                Nothing -> lookupEnv "PATH"
+    let extra = intercalate [searchPathSeparator] extras
+        path' = case mb_path of
+                    Nothing   -> extra
+                    Just path -> extra ++ searchPathSeparator : path
+    return [("PATH", Just path')]
 
 -- | Return the current environment extended with the given overrides.
+-- If an entry is specified twice in @overrides@, the second entry takes
+-- precedence.
 --
 getEffectiveEnvironment :: [(String, Maybe String)]
-                        -> IO (Maybe [(String, String)])
+                        -> NoCallStackIO (Maybe [(String, String)])
 getEffectiveEnvironment []        = return Nothing
 getEffectiveEnvironment overrides =
     fmap (Just . Map.toList . apply overrides . Map.fromList) getEnvironment
@@ -221,28 +247,28 @@ multiStageProgramInvocation simple (initial, middle, final) args =
 
         [c]    -> [ simple  `appendArgs` c ]
 
-        [c,c'] -> [ initial `appendArgs` c ]
-               ++ [ final   `appendArgs` c']
-
         (c:cs) -> [ initial `appendArgs` c ]
                ++ [ middle  `appendArgs` c'| c' <- init cs ]
                ++ [ final   `appendArgs` c'| let c' = last cs ]
 
   where
+    appendArgs :: ProgramInvocation -> [String] -> ProgramInvocation
     inv `appendArgs` as = inv { progInvokeArgs = progInvokeArgs inv ++ as }
 
+    splitChunks :: Int -> [[a]] -> [[[a]]]
     splitChunks len = unfoldr $ \s ->
       if null s then Nothing
                 else Just (chunk len s)
 
+    chunk :: Int -> [[a]] -> ([[a]], [[a]])
     chunk len (s:_) | length s >= len = error toolong
     chunk len ss    = chunk' [] len ss
 
-    chunk' acc _   []     = (reverse acc,[])
+    chunk' :: [[a]] -> Int -> [[a]] -> ([[a]], [[a]])
     chunk' acc len (s:ss)
       | len' < len = chunk' (s:acc) (len-len'-1) ss
-      | otherwise  = (reverse acc, s:ss)
       where len' = length s
+    chunk' acc _   ss     = (reverse acc, ss)
 
     toolong = "multiStageProgramInvocation: a single program arg is larger "
            ++ "than the maximum command line length!"

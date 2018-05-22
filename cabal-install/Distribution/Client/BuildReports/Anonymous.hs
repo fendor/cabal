@@ -26,19 +26,23 @@ module Distribution.Client.BuildReports.Anonymous (
 --    showList,
   ) where
 
+import Prelude ()
+import Distribution.Client.Compat.Prelude hiding (show)
+
 import qualified Distribution.Client.Types as BR
-         ( BuildResult, BuildFailure(..), BuildSuccess(..)
+         ( BuildOutcome, BuildFailure(..), BuildResult(..)
          , DocsResult(..), TestsResult(..) )
 import Distribution.Client.Utils
          ( mergeBy, MergeResult(..) )
 import qualified Paths_cabal_install (version)
 
 import Distribution.Package
-         ( PackageIdentifier(..), PackageName(..) )
+         ( PackageIdentifier(..), mkPackageName )
 import Distribution.PackageDescription
-         ( FlagName(..), FlagAssignment )
---import Distribution.Version
---         ( Version )
+         ( FlagName, mkFlagName, unFlagName
+         , FlagAssignment, mkFlagAssignment, unFlagAssignment )
+import Distribution.Version
+         ( mkVersion' )
 import Distribution.System
          ( OS, Arch )
 import Distribution.Compiler
@@ -57,14 +61,10 @@ import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
          ( Doc, render, char, text )
 import Text.PrettyPrint
-         ( (<+>), (<>) )
+         ( (<+>) )
 
-import Data.List
-         ( unfoldr, sortBy )
 import Data.Char as Char
          ( isAlpha, isAlphaNum )
-
-import Prelude hiding (show)
 
 data BuildReport
    = BuildReport {
@@ -120,7 +120,7 @@ data Outcome = NotTried | Failed | Ok
   deriving Eq
 
 new :: OS -> Arch -> CompilerId -> PackageIdentifier -> FlagAssignment
-    -> [PackageIdentifier] -> BR.BuildResult -> BuildReport
+    -> [PackageIdentifier] -> BR.BuildOutcome -> BuildReport
 new os' arch' comp pkgid flags deps result =
   BuildReport {
     package               = pkgid,
@@ -145,21 +145,22 @@ new os' arch' comp pkgid flags deps result =
       Left  (BR.BuildFailed     _) -> BuildFailed
       Left  (BR.TestsFailed     _) -> TestsFailed
       Left  (BR.InstallFailed   _) -> InstallFailed
-      Right (BR.BuildOk       _ _ _) -> InstallOk
+      Right (BR.BuildResult _ _ _) -> InstallOk
     convertDocsOutcome = case result of
-      Left _                                -> NotTried
-      Right (BR.BuildOk BR.DocsNotTried _ _)  -> NotTried
-      Right (BR.BuildOk BR.DocsFailed _ _)    -> Failed
-      Right (BR.BuildOk BR.DocsOk _ _)        -> Ok
+      Left _                                      -> NotTried
+      Right (BR.BuildResult BR.DocsNotTried _ _)  -> NotTried
+      Right (BR.BuildResult BR.DocsFailed _ _)    -> Failed
+      Right (BR.BuildResult BR.DocsOk _ _)        -> Ok
     convertTestsOutcome = case result of
-      Left  (BR.TestsFailed _)              -> Failed
-      Left _                                -> NotTried
-      Right (BR.BuildOk _ BR.TestsNotTried _) -> NotTried
-      Right (BR.BuildOk _ BR.TestsOk _)       -> Ok
+      Left  (BR.TestsFailed _)                    -> Failed
+      Left _                                      -> NotTried
+      Right (BR.BuildResult _ BR.TestsNotTried _) -> NotTried
+      Right (BR.BuildResult _ BR.TestsOk _)       -> Ok
 
 cabalInstallID :: PackageIdentifier
 cabalInstallID =
-  PackageIdentifier (PackageName "cabal-install") Paths_cabal_install.version
+  PackageIdentifier (mkPackageName "cabal-install")
+                    (mkVersion' Paths_cabal_install.version)
 
 -- ------------------------------------------------------------
 -- * External format
@@ -172,7 +173,7 @@ initialBuildReport = BuildReport {
     arch            = requiredField "arch",
     compiler        = requiredField "compiler",
     client          = requiredField "client",
-    flagAssignment  = [],
+    flagAssignment  = mempty,
     dependencies    = [],
     installOutcome  = requiredField "install-outcome",
 --    cabalVersion  = Nothing,
@@ -191,10 +192,9 @@ parse s = case parseFields s of
   ParseFailed perror -> Left  msg where (_, msg) = locatedErrorMsg perror
   ParseOk   _ report -> Right report
 
---FIXME: this does not allow for optional or repeated fields
 parseFields :: String -> ParseResult BuildReport
 parseFields input = do
-  fields <- mapM extractField =<< readFields input
+  fields <- traverse extractField =<< readFields input
   let merged = mergeBy (\desc (_,name,_) -> compare (fieldName desc) name)
                        sortedFieldDescrs
                        (sortBy (comparing (\(_,name,_) -> name)) fields)
@@ -249,7 +249,8 @@ fieldDescrs =
  , simpleField "client"          Text.disp      Text.parse
                                  client         (\v r -> r { client = v })
  , listField   "flags"           dispFlag       parseFlag
-                                 flagAssignment (\v r -> r { flagAssignment = v })
+                                 (unFlagAssignment . flagAssignment)
+                                 (\v r -> r { flagAssignment = mkFlagAssignment v })
  , listField   "dependencies"    Text.disp      Text.parse
                                  dependencies   (\v r -> r { dependencies = v })
  , simpleField "install-outcome" Text.disp      Text.parse
@@ -264,15 +265,15 @@ sortedFieldDescrs :: [FieldDescr BuildReport]
 sortedFieldDescrs = sortBy (comparing fieldName) fieldDescrs
 
 dispFlag :: (FlagName, Bool) -> Disp.Doc
-dispFlag (FlagName name, True)  =                  Disp.text name
-dispFlag (FlagName name, False) = Disp.char '-' <> Disp.text name
+dispFlag (fname, True)  =                  Disp.text (unFlagName fname)
+dispFlag (fname, False) = Disp.char '-' <<>> Disp.text (unFlagName fname)
 
 parseFlag :: Parse.ReadP r (FlagName, Bool)
 parseFlag = do
   name <- Parse.munch1 (\c -> Char.isAlphaNum c || c == '_' || c == '-')
   case name of
-    ('-':flag) -> return (FlagName flag, False)
-    flag       -> return (FlagName flag, True)
+    ('-':flag) -> return (mkFlagName flag, False)
+    flag       -> return (mkFlagName flag, True)
 
 instance Text.Text InstallOutcome where
   disp PlanningFailed  = Disp.text "PlanningFailed"

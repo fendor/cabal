@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.TestSuite
@@ -20,6 +23,9 @@ module Distribution.TestSuite
     , Result(..)
     , testGroup
     ) where
+
+import Prelude ()
+import Distribution.Compat.Prelude
 
 data TestInstance = TestInstance
     { run       :: IO Progress      -- ^ Perform the test.

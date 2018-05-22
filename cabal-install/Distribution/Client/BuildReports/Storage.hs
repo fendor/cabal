@@ -28,9 +28,11 @@ import Distribution.Client.BuildReports.Anonymous (BuildReport)
 
 import Distribution.Client.Types
 import qualified Distribution.Client.InstallPlan as InstallPlan
-import qualified Distribution.Client.ComponentDeps as CD
 import Distribution.Client.InstallPlan
          ( InstallPlan )
+
+import qualified Distribution.Solver.Types.ComponentDeps as CD
+import           Distribution.Solver.Types.SourcePackage
 
 import Distribution.Package
          ( PackageId, packageId )
@@ -49,7 +51,7 @@ import Distribution.Simple.Utils
 import Data.List
          ( groupBy, sortBy )
 import Data.Maybe
-         ( catMaybes )
+         ( mapMaybe )
 import System.FilePath
          ( (</>), takeDirectory )
 import System.Directory
@@ -79,7 +81,9 @@ storeAnonymous reports = sequence_
                -> [(BuildReport, Repo, RemoteRepo)]
     onlyRemote rs =
       [ (report, repo, remoteRepo)
-      | (report, Just repo@Repo { repoKind = Left remoteRepo }) <- rs ]
+      | (report, Just repo) <- rs
+      , Just remoteRepo     <- [maybeRepoRemote repo]
+      ]
 
 storeLocal :: CompilerInfo -> [PathTemplate] -> [(BuildReport, Maybe Repo)]
            -> Platform -> IO ()
@@ -101,7 +105,7 @@ storeLocal cinfo templates reports platform = sequence_
         fromPathTemplate (substPathTemplate env template)
       where env = initialPathTemplateEnv
                     (BuildReport.package  report)
-                    -- ToDo: In principle, we can support $pkgkey, but only
+                    -- TODO: In principle, we can support $pkgkey, but only
                     -- if the configure step succeeds.  So add a Maybe field
                     -- to the build report, and either use that or make up
                     -- a fake identifier if it's not available.
@@ -119,38 +123,34 @@ storeLocal cinfo templates reports platform = sequence_
 
 fromInstallPlan :: Platform -> CompilerId
                 -> InstallPlan
+                -> BuildOutcomes
                 -> [(BuildReport, Maybe Repo)]
-fromInstallPlan platform comp plan =
-     catMaybes
-   . map (fromPlanPackage platform comp)
+fromInstallPlan platform comp plan buildOutcomes =
+     mapMaybe (\pkg -> fromPlanPackage
+                         platform comp pkg
+                         (InstallPlan.lookupBuildOutcome pkg buildOutcomes))
    . InstallPlan.toList
    $ plan
 
 fromPlanPackage :: Platform -> CompilerId
                 -> InstallPlan.PlanPackage
+                -> Maybe BuildOutcome
                 -> Maybe (BuildReport, Maybe Repo)
-fromPlanPackage (Platform arch os) comp planPackage = case planPackage of
-  InstallPlan.Installed (ReadyPackage (ConfiguredPackage srcPkg flags _ _) deps)
-                         _ result
-    -> Just $ ( BuildReport.new os arch comp
-                                (packageId srcPkg) flags
-                                (map packageId (CD.nonSetupDeps deps))
-                                (Right result)
-              , extractRepo srcPkg)
-
-  InstallPlan.Failed (ConfiguredPackage srcPkg flags _ deps) result
-    -> Just $ ( BuildReport.new os arch comp
-                                (packageId srcPkg) flags
-                                (map confSrcId (CD.nonSetupDeps deps))
-                                (Left result)
-              , extractRepo srcPkg )
-
-  _ -> Nothing
-
+fromPlanPackage (Platform arch os) comp
+                (InstallPlan.Configured (ConfiguredPackage _ srcPkg flags _ deps))
+                (Just buildResult) =
+      Just ( BuildReport.new os arch comp
+                             (packageId srcPkg) flags
+                             (map packageId (CD.nonSetupDeps deps))
+                             buildResult
+           , extractRepo srcPkg)
   where
     extractRepo (SourcePackage { packageSource = RepoTarballPackage repo _ _ })
                   = Just repo
     extractRepo _ = Nothing
+
+fromPlanPackage _ _ _ _ = Nothing
+
 
 fromPlanningFailure :: Platform -> CompilerId
     -> [PackageId] -> FlagAssignment -> [(BuildReport, Maybe Repo)]

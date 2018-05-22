@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.PreProcess
@@ -26,52 +29,32 @@ module Distribution.Simple.PreProcess (preprocessComponent, preprocessExtras,
                                )
     where
 
+import Prelude ()
+import Distribution.Compat.Prelude
+import Distribution.Compat.Stack
 
-import Control.Monad
-import Distribution.Simple.PreProcess.Unlit (unlit)
+import Distribution.Simple.PreProcess.Unlit
+import Distribution.Backpack.DescribeUnitId
 import Distribution.Package
-         ( Package(..), PackageName(..) )
 import qualified Distribution.ModuleName as ModuleName
+import Distribution.ModuleName (ModuleName)
 import Distribution.PackageDescription as PD
-         ( PackageDescription(..), BuildInfo(..)
-         , Executable(..)
-         , Library(..), libModules
-         , TestSuite(..), testModules
-         , TestSuiteInterface(..)
-         , Benchmark(..), benchmarkModules, BenchmarkInterface(..) )
 import qualified Distribution.InstalledPackageInfo as Installed
-         ( InstalledPackageInfo_(..) )
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.CCompiler
-         ( cSourceExtensions )
 import Distribution.Simple.Compiler
-         ( CompilerFlavor(..)
-         , compilerFlavor, compilerCompatVersion, compilerVersion )
 import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(..), Component(..) )
-import Distribution.Simple.BuildPaths (autogenModulesDir,cppHeaderName)
+import Distribution.Simple.BuildPaths
 import Distribution.Simple.Utils
-         ( createDirectoryIfMissingVerbose, withUTF8FileContents, writeUTF8File
-         , die, setupMessage, intercalate, copyFileVerbose, moreRecentFile
-         , findFileWithExtension, findFileWithExtension'
-         , getDirectoryContentsRecursive )
 import Distribution.Simple.Program
-         ( Program(..), ConfiguredProgram(..), programPath
-         , requireProgram, requireProgramVersion
-         , rawSystemProgramConf, rawSystemProgram
-         , greencardProgram, cpphsProgram, hsc2hsProgram, c2hsProgram
-         , happyProgram, alexProgram, ghcProgram, ghcjsProgram, gccProgram )
 import Distribution.Simple.Test.LibV09
-         ( writeSimpleTestStub, stubFilePath, stubName )
 import Distribution.System
-         ( OS(..), buildOS, Arch(..), Platform(..) )
 import Distribution.Text
 import Distribution.Version
-         ( Version(..), anyVersion, orLaterVersion )
 import Distribution.Verbosity
+import Distribution.Types.ForeignLib
+import Distribution.Types.UnqualComponentName
 
-import Data.Maybe (fromMaybe)
-import Data.List (nub, isSuffixOf)
 import System.Directory (doesFileExist)
 import System.Info (os, arch)
 import System.FilePath (splitExtension, dropExtensions, (</>), (<.>),
@@ -156,57 +139,71 @@ runSimplePreProcessor pp inFile outFile verbosity =
 -- |A preprocessor for turning non-Haskell files with the given extension
 -- into plain Haskell source files.
 type PPSuffixHandler
-    = (String, BuildInfo -> LocalBuildInfo -> PreProcessor)
+    = (String, BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor)
 
 -- | Apply preprocessors to the sources from 'hsSourceDirs' for a given
 -- component (lib, exe, or test suite).
 preprocessComponent :: PackageDescription
                     -> Component
                     -> LocalBuildInfo
+                    -> ComponentLocalBuildInfo
                     -> Bool
                     -> Verbosity
                     -> [PPSuffixHandler]
                     -> IO ()
-preprocessComponent pd comp lbi isSrcDist verbosity handlers = case comp of
+preprocessComponent pd comp lbi clbi isSrcDist verbosity handlers = do
+ -- NB: never report instantiation here; we'll report it properly when
+ -- building.
+ setupMessage' verbosity "Preprocessing" (packageId pd)
+    (componentLocalName clbi) (Nothing :: Maybe [(ModuleName, Module)])
+ case comp of
   (CLib lib@Library{ libBuildInfo = bi }) -> do
-    let dirs = hsSourceDirs bi ++ [autogenModulesDir lbi]
-    setupMessage verbosity "Preprocessing library" (packageId pd)
-    forM_ (map ModuleName.toFilePath $ libModules lib) $
-      pre dirs (buildDir lbi) (localHandlers bi)
+    let dirs = hsSourceDirs bi ++ [autogenComponentModulesDir lbi clbi
+                                  ,autogenPackageModulesDir lbi]
+    for_ (map ModuleName.toFilePath $ allLibModules lib clbi) $
+      pre dirs (componentBuildDir lbi clbi) (localHandlers bi)
+  (CFLib flib@ForeignLib { foreignLibBuildInfo = bi, foreignLibName = nm }) -> do
+    let nm' = unUnqualComponentName nm
+    let flibDir = buildDir lbi </> nm' </> nm' ++ "-tmp"
+        dirs    = hsSourceDirs bi ++ [autogenComponentModulesDir lbi clbi
+                                     ,autogenPackageModulesDir lbi]
+    for_ (map ModuleName.toFilePath $ foreignLibModules flib) $
+      pre dirs flibDir (localHandlers bi)
   (CExe exe@Executable { buildInfo = bi, exeName = nm }) -> do
-    let exeDir = buildDir lbi </> nm </> nm ++ "-tmp"
-        dirs   = hsSourceDirs bi ++ [autogenModulesDir lbi]
-    setupMessage verbosity ("Preprocessing executable '" ++ nm ++ "' for") (packageId pd)
-    forM_ (map ModuleName.toFilePath $ otherModules bi) $
+    let nm' = unUnqualComponentName nm
+    let exeDir = buildDir lbi </> nm' </> nm' ++ "-tmp"
+        dirs   = hsSourceDirs bi ++ [autogenComponentModulesDir lbi clbi
+                                    ,autogenPackageModulesDir lbi]
+    for_ (map ModuleName.toFilePath $ otherModules bi) $
       pre dirs exeDir (localHandlers bi)
     pre (hsSourceDirs bi) exeDir (localHandlers bi) $
       dropExtensions (modulePath exe)
   CTest test@TestSuite{ testName = nm } -> do
-    setupMessage verbosity ("Preprocessing test suite '" ++ nm ++ "' for") (packageId pd)
+    let nm' = unUnqualComponentName nm
     case testInterface test of
       TestSuiteExeV10 _ f ->
-          preProcessTest test f $ buildDir lbi </> testName test
-              </> testName test ++ "-tmp"
+          preProcessTest test f $ buildDir lbi </> nm' </> nm' ++ "-tmp"
       TestSuiteLibV09 _ _ -> do
           let testDir = buildDir lbi </> stubName test
                   </> stubName test ++ "-tmp"
           writeSimpleTestStub test testDir
           preProcessTest test (stubFilePath test) testDir
-      TestSuiteUnsupported tt -> die $ "No support for preprocessing test "
-                                    ++ "suite type " ++ display tt
+      TestSuiteUnsupported tt ->
+          die' verbosity $ "No support for preprocessing test "
+                        ++ "suite type " ++ display tt
   CBench bm@Benchmark{ benchmarkName = nm } -> do
-    setupMessage verbosity ("Preprocessing benchmark '" ++ nm ++ "' for") (packageId pd)
+    let nm' = unUnqualComponentName nm
     case benchmarkInterface bm of
       BenchmarkExeV10 _ f ->
-          preProcessBench bm f $ buildDir lbi </> benchmarkName bm
-              </> benchmarkName bm ++ "-tmp"
-      BenchmarkUnsupported tt -> die $ "No support for preprocessing benchmark "
-                                 ++ "type " ++ display tt
+          preProcessBench bm f $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+      BenchmarkUnsupported tt ->
+          die' verbosity $ "No support for preprocessing benchmark "
+                        ++ "type " ++ display tt
   where
     builtinHaskellSuffixes = ["hs", "lhs", "hsig", "lhsig"]
     builtinCSuffixes       = cSourceExtensions
     builtinSuffixes        = builtinHaskellSuffixes ++ builtinCSuffixes
-    localHandlers bi = [(ext, h bi lbi) | (ext, h) <- handlers]
+    localHandlers bi = [(ext, h bi lbi clbi) | (ext, h) <- handlers]
     pre dirs dir lhndlrs fp =
       preprocessFile dirs dir isSrcDist fp verbosity builtinSuffixes lhndlrs
     preProcessTest test = preProcessComponent (testBuildInfo test)
@@ -215,7 +212,8 @@ preprocessComponent pd comp lbi isSrcDist verbosity handlers = case comp of
                          (benchmarkModules bm)
     preProcessComponent bi modules exePath dir = do
         let biHandlers = localHandlers bi
-            sourceDirs = hsSourceDirs bi ++ [ autogenModulesDir lbi ]
+            sourceDirs = hsSourceDirs bi ++ [ autogenComponentModulesDir lbi clbi
+                                            , autogenPackageModulesDir lbi ]
         sequence_ [ preprocessFile sourceDirs dir isSrcDist
                 (ModuleName.toFilePath modu) verbosity builtinSuffixes
                 biHandlers
@@ -254,8 +252,9 @@ preprocessFile searchLoc buildLoc forSDist baseFile verbosity builtinSuffixes ha
       Nothing -> do
                  bsrcFiles <- findFileWithExtension builtinSuffixes (buildLoc : searchLoc) baseFile
                  case bsrcFiles of
-                  Nothing -> die $ "can't find source for " ++ baseFile
-                                ++ " in " ++ intercalate ", " searchLoc
+                  Nothing ->
+                    die' verbosity $ "can't find source for " ++ baseFile
+                                  ++ " in " ++ intercalate ", " searchLoc
                   _       -> return ()
         -- found a pre-processable file in one of the source dirs
       Just (psrcLoc, psrcRelFile) -> do
@@ -318,12 +317,12 @@ preprocessFile searchLoc buildLoc forSDist baseFile verbosity builtinSuffixes ha
 -- * known preprocessors
 -- ------------------------------------------------------------
 
-ppGreenCard :: BuildInfo -> LocalBuildInfo -> PreProcessor
-ppGreenCard _ lbi
+ppGreenCard :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppGreenCard _ lbi _
     = PreProcessor {
         platformIndependent = False,
         runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
-          rawSystemProgramConf verbosity greencardProgram (withPrograms lbi)
+          runDbProgram verbosity greencardProgram (withPrograms lbi)
               (["-tffi", "-o" ++ outFile, inFile])
       }
 
@@ -333,32 +332,32 @@ ppUnlit :: PreProcessor
 ppUnlit =
   PreProcessor {
     platformIndependent = True,
-    runPreProcessor = mkSimplePreProcessor $ \inFile outFile _verbosity ->
+    runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
       withUTF8FileContents inFile $ \contents ->
-        either (writeUTF8File outFile) die (unlit inFile contents)
+        either (writeUTF8File outFile) (die' verbosity) (unlit inFile contents)
   }
 
-ppCpp :: BuildInfo -> LocalBuildInfo -> PreProcessor
+ppCpp :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
 ppCpp = ppCpp' []
 
-ppCpp' :: [String] -> BuildInfo -> LocalBuildInfo -> PreProcessor
-ppCpp' extraArgs bi lbi =
+ppCpp' :: [String] -> BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppCpp' extraArgs bi lbi clbi =
   case compilerFlavor (compiler lbi) of
-    GHC   -> ppGhcCpp ghcProgram   (>= Version [6,6] []) args bi lbi
-    GHCJS -> ppGhcCpp ghcjsProgram (const True)          args bi lbi
-    _     -> ppCpphs  args bi lbi
+    GHC   -> ppGhcCpp ghcProgram   (>= mkVersion [6,6])  args bi lbi clbi
+    GHCJS -> ppGhcCpp ghcjsProgram (const True)          args bi lbi clbi
+    _     -> ppCpphs  args bi lbi clbi
   where cppArgs = getCppOptions bi lbi
         args    = cppArgs ++ extraArgs
 
 ppGhcCpp :: Program -> (Version -> Bool)
-         -> [String] -> BuildInfo -> LocalBuildInfo -> PreProcessor
-ppGhcCpp program xHs extraArgs _bi lbi =
+         -> [String] -> BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppGhcCpp program xHs extraArgs _bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
     runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
       (prog, version, _) <- requireProgramVersion verbosity
                               program anyVersion (withPrograms lbi)
-      rawSystemProgram verbosity prog $
+      runProgram verbosity prog $
           ["-E", "-cpp"]
           -- This is a bit of an ugly hack. We're going to
           -- unlit the file ourselves later on if appropriate,
@@ -366,34 +365,34 @@ ppGhcCpp program xHs extraArgs _bi lbi =
           -- double-unlitted. In the future we might switch to
           -- using cpphs --unlit instead.
        ++ (if xHs version then ["-x", "hs"] else [])
-       ++ [ "-optP-include", "-optP"++ (autogenModulesDir lbi </> cppHeaderName) ]
+       ++ [ "-optP-include", "-optP"++ (autogenComponentModulesDir lbi clbi </> cppHeaderName) ]
        ++ ["-o", outFile, inFile]
        ++ extraArgs
   }
 
-ppCpphs :: [String] -> BuildInfo -> LocalBuildInfo -> PreProcessor
-ppCpphs extraArgs _bi lbi =
+ppCpphs :: [String] -> BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppCpphs extraArgs _bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
     runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
       (cpphsProg, cpphsVersion, _) <- requireProgramVersion verbosity
                                         cpphsProgram anyVersion (withPrograms lbi)
-      rawSystemProgram verbosity cpphsProg $
+      runProgram verbosity cpphsProg $
           ("-O" ++ outFile) : inFile
         : "--noline" : "--strip"
-        : (if cpphsVersion >= Version [1,6] []
-             then ["--include="++ (autogenModulesDir lbi </> cppHeaderName)]
+        : (if cpphsVersion >= mkVersion [1,6]
+             then ["--include="++ (autogenComponentModulesDir lbi clbi </> cppHeaderName)]
              else [])
         ++ extraArgs
   }
 
-ppHsc2hs :: BuildInfo -> LocalBuildInfo -> PreProcessor
-ppHsc2hs bi lbi =
+ppHsc2hs :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppHsc2hs bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
     runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity -> do
       (gccProg, _) <- requireProgram verbosity gccProgram (withPrograms lbi)
-      rawSystemProgramConf verbosity hsc2hsProgram (withPrograms lbi) $
+      runDbProgram verbosity hsc2hsProgram (withPrograms lbi) $
           [ "--cc=" ++ programPath gccProg
           , "--ld=" ++ programPath gccProg ]
 
@@ -422,11 +421,13 @@ ppHsc2hs bi lbi =
 
           -- Options from the current package:
        ++ [ "--cflag=-I" ++ dir | dir <- PD.includeDirs  bi ]
+       ++ [ "--cflag=-I" ++ buildDir lbi </> dir | dir <- PD.includeDirs bi ]
        ++ [ "--cflag="   ++ opt | opt <- PD.ccOptions    bi
                                       ++ PD.cppOptions   bi ]
        ++ [ "--cflag="   ++ opt | opt <-
-               [ "-I" ++ autogenModulesDir lbi,
-                 "-include", autogenModulesDir lbi </> cppHeaderName ] ]
+               [ "-I" ++ autogenComponentModulesDir lbi clbi,
+                 "-I" ++ autogenPackageModulesDir lbi,
+                 "-include", autogenComponentModulesDir lbi clbi </> cppHeaderName ] ]
        ++ [ "--lflag=-L" ++ opt | opt <- PD.extraLibDirs bi ]
        ++ [ "--lflag=-Wl,-R," ++ opt | isELF
                                 , opt <- PD.extraLibDirs bi ]
@@ -448,19 +449,28 @@ ppHsc2hs bi lbi =
        ++ ["-o", outFile, inFile]
   }
   where
-    pkgs = PackageIndex.topologicalOrder (packageHacks (installedPkgs lbi))
+    hacked_index = packageHacks (installedPkgs lbi)
+    -- Look only at the dependencies of the current component
+    -- being built!  This relies on 'installedPkgs' maintaining
+    -- 'InstalledPackageInfo' for internal deps too; see #2971.
+    pkgs = PackageIndex.topologicalOrder $
+           case PackageIndex.dependencyClosure hacked_index
+                    (map fst (componentPackageDeps clbi)) of
+            Left index' -> index'
+            Right inf ->
+                error ("ppHsc2hs: broken closure: " ++ show inf)
     isOSX = case buildOS of OSX -> True; _ -> False
-    isELF = case buildOS of OSX -> False; Windows -> False; _ -> True;
+    isELF = case buildOS of OSX -> False; Windows -> False; AIX -> False; _ -> True;
     packageHacks = case compilerFlavor (compiler lbi) of
       GHC   -> hackRtsPackage
       GHCJS -> hackRtsPackage
       _     -> id
     -- We don't link in the actual Haskell libraries of our dependencies, so
     -- the -u flags in the ldOptions of the rts package mean linking fails on
-    -- OS X (it's ld is a tad stricter than gnu ld). Thus we remove the
+    -- OS X (its ld is a tad stricter than gnu ld). Thus we remove the
     -- ldOptions for GHC's rts package:
     hackRtsPackage index =
-      case PackageIndex.lookupPackageName index (PackageName "rts") of
+      case PackageIndex.lookupPackageName index (mkPackageName "rts") of
         [(_, [rts])]
            -> PackageIndex.insert rts { Installed.ldOptions = [] } index
         _  -> error "No (or multiple) ghc rts package is registered!!"
@@ -469,22 +479,22 @@ ppHsc2hsExtras :: PreProcessorExtras
 ppHsc2hsExtras buildBaseDir = filter ("_hsc.c" `isSuffixOf`) `fmap`
                               getDirectoryContentsRecursive buildBaseDir
 
-ppC2hs :: BuildInfo -> LocalBuildInfo -> PreProcessor
-ppC2hs bi lbi =
+ppC2hs :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppC2hs bi lbi clbi =
   PreProcessor {
     platformIndependent = False,
     runPreProcessor = \(inBaseDir, inRelativeFile)
                        (outBaseDir, outRelativeFile) verbosity -> do
       (c2hsProg, _, _) <- requireProgramVersion verbosity
-                            c2hsProgram (orLaterVersion (Version [0,15] []))
+                            c2hsProgram (orLaterVersion (mkVersion [0,15]))
                             (withPrograms lbi)
       (gccProg, _) <- requireProgram verbosity gccProgram (withPrograms lbi)
-      rawSystemProgram verbosity c2hsProg $
+      runProgram verbosity c2hsProg $
 
           -- Options from the current package:
            [ "--cpp=" ++ programPath gccProg, "--cppopts=-E" ]
         ++ [ "--cppopts=" ++ opt | opt <- getCppOptions bi lbi ]
-        ++ [ "--cppopts=-include" ++ (autogenModulesDir lbi </> cppHeaderName) ]
+        ++ [ "--cppopts=-include" ++ (autogenComponentModulesDir lbi clbi </> cppHeaderName) ]
         ++ [ "--include=" ++ outBaseDir ]
 
           -- Options from dependent packages
@@ -550,10 +560,11 @@ platformDefines lbi =
     -- FIXME: this forces GHC's crazy 4.8.2 -> 408 convention on all
     -- the other compilers. Check if that's really what they want.
     versionInt :: Version -> String
-    versionInt (Version { versionBranch = [] }) = "1"
-    versionInt (Version { versionBranch = [n] }) = show n
-    versionInt (Version { versionBranch = n1:n2:_ })
-      = -- 6.8.x -> 608
+    versionInt v = case versionNumbers v of
+      [] -> "1"
+      [n] -> show n
+      n1:n2:_ ->
+        -- 6.8.x -> 608
         -- 6.10.x -> 610
         let s1 = show n1
             s2 = show n2
@@ -561,6 +572,7 @@ platformDefines lbi =
                      _ : _ : _ -> ""
                      _         -> "0"
         in s1 ++ middle ++ s2
+
     osStr = case hostOS of
       Linux     -> ["linux"]
       Windows   -> ["mingw32"]
@@ -598,16 +610,16 @@ platformDefines lbi =
       JavaScript  -> ["javascript"]
       OtherArch _ -> []
 
-ppHappy :: BuildInfo -> LocalBuildInfo -> PreProcessor
-ppHappy _ lbi = pp { platformIndependent = True }
+ppHappy :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppHappy _ lbi _ = pp { platformIndependent = True }
   where pp = standardPP lbi happyProgram (hcFlags hc)
         hc = compilerFlavor (compiler lbi)
         hcFlags GHC = ["-agc"]
         hcFlags GHCJS = ["-agc"]
         hcFlags _ = []
 
-ppAlex :: BuildInfo -> LocalBuildInfo -> PreProcessor
-ppAlex _ lbi = pp { platformIndependent = True }
+ppAlex :: BuildInfo -> LocalBuildInfo -> ComponentLocalBuildInfo -> PreProcessor
+ppAlex _ lbi _ = pp { platformIndependent = True }
   where pp = standardPP lbi alexProgram (hcFlags hc)
         hc = compilerFlavor (compiler lbi)
         hcFlags GHC = ["-g"]
@@ -619,7 +631,7 @@ standardPP lbi prog args =
   PreProcessor {
     platformIndependent = False,
     runPreProcessor = mkSimplePreProcessor $ \inFile outFile verbosity ->
-      rawSystemProgramConf verbosity prog (withPrograms lbi)
+      runDbProgram verbosity prog (withPrograms lbi)
                            (args ++ ["-o", outFile, inFile])
   }
 
@@ -645,26 +657,54 @@ knownExtrasHandlers = [ ppC2hsExtras, ppHsc2hsExtras ]
 
 -- | Find any extra C sources generated by preprocessing that need to
 -- be added to the component (addresses issue #238).
-preprocessExtras :: Component
+preprocessExtras :: Verbosity
+                 -> Component
                  -> LocalBuildInfo
                  -> IO [FilePath]
-preprocessExtras comp lbi = case comp of
+preprocessExtras verbosity comp lbi = case comp of
   CLib _ -> pp $ buildDir lbi
-  (CExe Executable { exeName = nm }) ->
-    pp $ buildDir lbi </> nm </> nm ++ "-tmp"
+  (CExe Executable { exeName = nm }) -> do
+    let nm' = unUnqualComponentName nm
+    pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+  (CFLib ForeignLib { foreignLibName = nm }) -> do
+    let nm' = unUnqualComponentName nm
+    pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
   CTest test -> do
+    let nm' = unUnqualComponentName $ testName test
     case testInterface test of
       TestSuiteExeV10 _ _ ->
-          pp $ buildDir lbi </> testName test </> testName test ++ "-tmp"
+          pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
       TestSuiteLibV09 _ _ ->
           pp $ buildDir lbi </> stubName test </> stubName test ++ "-tmp"
-      TestSuiteUnsupported tt -> die $ "No support for preprocessing test "
+      TestSuiteUnsupported tt -> die' verbosity $ "No support for preprocessing test "
                                     ++ "suite type " ++ display tt
   CBench bm -> do
+    let nm' = unUnqualComponentName $ benchmarkName bm
     case benchmarkInterface bm of
       BenchmarkExeV10 _ _ ->
-          pp $ buildDir lbi </> benchmarkName bm </> benchmarkName bm ++ "-tmp"
-      BenchmarkUnsupported tt -> die $ "No support for preprocessing benchmark "
-                                 ++ "type " ++ display tt
+          pp $ buildDir lbi </> nm' </> nm' ++ "-tmp"
+      BenchmarkUnsupported tt ->
+          die' verbosity $ "No support for preprocessing benchmark "
+                        ++ "type " ++ display tt
   where
-    pp dir = (map (dir </>) . concat) `fmap` forM knownExtrasHandlers ($ dir)
+    pp :: FilePath -> IO [FilePath]
+    pp dir = (map (dir </>) . filter not_sub . concat)
+          <$> for knownExtrasHandlers
+                (withLexicalCallStack (\f -> f dir))
+    -- TODO: This is a terrible hack to work around #3545 while we don't
+    -- reorganize the directory layout.  Basically, for the main
+    -- library, we might accidentally pick up autogenerated sources for
+    -- our subcomponents, because they are all stored as subdirectories
+    -- in dist/build.  This is a cheap and cheerful check to prevent
+    -- this from happening.  It is not particularly correct; for example
+    -- if a user has a test suite named foobar and puts their C file in
+    -- foobar/foo.c, this test will incorrectly exclude it.  But I
+    -- didn't want to break BC...
+    not_sub p = and [ not (pre `isPrefixOf` p) | pre <- component_dirs ]
+    component_dirs = component_names (localPkgDescr lbi)
+    -- TODO: libify me
+    component_names pkg_descr = fmap unUnqualComponentName $
+        mapMaybe libName (subLibraries pkg_descr) ++
+        map exeName (executables pkg_descr) ++
+        map testName (testSuites pkg_descr) ++
+        map benchmarkName (benchmarks pkg_descr)

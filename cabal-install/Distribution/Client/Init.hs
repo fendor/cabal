@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Init
@@ -18,8 +17,13 @@ module Distribution.Client.Init (
 
     -- * Commands
     initCabal
+  , pvpize
+  , incVersion
 
   ) where
+
+import Prelude ()
+import Distribution.Client.Compat.Prelude hiding (empty)
 
 import System.IO
   ( hSetBuffering, stdout, BufferMode(..) )
@@ -27,47 +31,37 @@ import System.Directory
   ( getCurrentDirectory, doesDirectoryExist, doesFileExist, copyFile
   , getDirectoryContents, createDirectoryIfMissing )
 import System.FilePath
-  ( (</>), (<.>), takeBaseName )
+  ( (</>), (<.>), takeBaseName, equalFilePath )
 import Data.Time
   ( getCurrentTime, utcToLocalTime, toGregorian, localDay, getCurrentTimeZone )
 
-import Data.Char
-  ( toUpper )
 import Data.List
-  ( intercalate, nub, groupBy, (\\) )
-import Data.Maybe
-  ( fromMaybe, isJust, catMaybes, listToMaybe )
+  ( groupBy, (\\) )
 import Data.Function
   ( on )
 import qualified Data.Map as M
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative
-  ( (<$>) )
-import Data.Traversable
-  ( traverse )
-#endif
 import Control.Monad
-  ( when, unless, (>=>), join, forM_ )
+  ( (>=>), join, forM_, mapM, mapM_ )
 import Control.Arrow
   ( (&&&), (***) )
 
 import Text.PrettyPrint hiding (mode, cat)
 
-import Data.Version
-  ( Version(..) )
 import Distribution.Version
-  ( orLaterVersion, earlierVersion, intersectVersionRanges, VersionRange )
+  ( Version, mkVersion, alterVersion
+  , orLaterVersion, earlierVersion, intersectVersionRanges, VersionRange )
 import Distribution.Verbosity
   ( Verbosity )
 import Distribution.ModuleName
-  ( ModuleName, fromString )  -- And for the Text instance
+  ( ModuleName )  -- And for the Text instance
 import Distribution.InstalledPackageInfo
-  ( InstalledPackageInfo, sourcePackageId, exposed )
+  ( InstalledPackageInfo, exposed )
 import qualified Distribution.Package as P
 import Language.Haskell.Extension ( Language(..) )
 
 import Distribution.Client.Init.Types
-  ( InitFlags(..), PackageType(..), Category(..) )
+  ( InitFlags(..), BuildType(..), PackageType(..), Category(..)
+  , displayPackageType )
 import Distribution.Client.Init.Licenses
   ( bsd2, bsd3, gplv2, gplv3, lgpl21, lgpl3, agplv3, apache20, mit, mpl20, isc )
 import Distribution.Client.Init.Heuristics
@@ -82,35 +76,40 @@ import Distribution.ReadE
   ( runReadE, readP_to_E )
 import Distribution.Simple.Setup
   ( Flag(..), flagToMaybe )
+import Distribution.Simple.Utils
+  ( dropWhileEndLE )
 import Distribution.Simple.Configure
   ( getInstalledPackages )
 import Distribution.Simple.Compiler
   ( PackageDBStack, Compiler )
 import Distribution.Simple.Program
-  ( ProgramConfiguration )
+  ( ProgramDb )
 import Distribution.Simple.PackageIndex
   ( InstalledPackageIndex, moduleNameIndex )
 import Distribution.Text
   ( display, Text(..) )
 
-import Distribution.Client.PackageIndex
+import Distribution.Solver.Types.PackageIndex
   ( elemByPackageName )
+
 import Distribution.Client.IndexUtils
   ( getSourcePackages )
 import Distribution.Client.Types
-  ( SourcePackageDb(..), Repo )
+  ( SourcePackageDb(..) )
+import Distribution.Client.Setup
+  ( RepoContext(..) )
 
 initCabal :: Verbosity
           -> PackageDBStack
-          -> [Repo]
+          -> RepoContext
           -> Compiler
-          -> ProgramConfiguration
+          -> ProgramDb
           -> InitFlags
           -> IO ()
-initCabal verbosity packageDBs repos comp conf initFlags = do
+initCabal verbosity packageDBs repoCtxt comp progdb initFlags = do
 
-  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
-  sourcePkgDb <- getSourcePackages verbosity repos
+  installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
+  sourcePkgDb <- getSourcePackages verbosity repoCtxt
 
   hSetBuffering stdout NoBuffering
 
@@ -198,7 +197,7 @@ getPackageName sourcePkgDb flags = do
 --  if possible.
 getVersion :: InitFlags -> IO InitFlags
 getVersion flags = do
-  let v = Just $ Version [0,1,0,0] []
+  let v = Just $ mkVersion [0,1,0,0]
   v' <-     return (flagToMaybe $ version flags)
         ?>> maybePrompt flags (prompt "Package version" v)
         ?>> return v
@@ -211,8 +210,20 @@ getLicense flags = do
          ?>> fmap (fmap (either UnknownLicense id))
                   (maybePrompt flags
                     (promptList "Please choose a license" listedLicenses (Just BSD3) display True))
-  return $ flags { license = maybeToFlag lic }
+
+  if isLicenseInvalid lic
+    then putStrLn promptInvalidOtherLicenseMsg >> getLicense flags
+    else return $ flags { license = maybeToFlag lic }
+
   where
+    isLicenseInvalid (Just (UnknownLicense t)) = any (not . isAlphaNum) t
+    isLicenseInvalid _ = False
+
+    promptInvalidOtherLicenseMsg = "\nThe license must be alphanumeric. " ++
+                                   "If your license name has many words, " ++
+                                   "the convention is to use camel case (e.g. PublicDomain). " ++
+                                   "Please choose a different license."
+
     listedLicenses =
       knownLicenses \\ [GPL Nothing, LGPL Nothing, AGPL Nothing
                        , Apache Nothing, OtherLicense]
@@ -302,16 +313,16 @@ guessExtraSourceFiles flags = do
 -- | Ask whether the project builds a library or executable.
 getLibOrExec :: InitFlags -> IO InitFlags
 getLibOrExec flags = do
-  isLib <-     return (flagToMaybe $ packageType flags)
+  pkgType <-     return (flagToMaybe $ packageType flags)
            ?>> maybePrompt flags (either (const Library) id `fmap`
                                    promptList "What does the package build"
-                                   [Library, Executable]
-                                   Nothing display False)
+                                   [Library, Executable, LibraryAndExecutable]
+                                   Nothing displayPackageType False)
            ?>> return (Just Library)
-  mainFile <- if isLib /= Just Executable then return Nothing else
+  mainFile <- if pkgType == Just Library then return Nothing else
                     getMainFile flags
 
-  return $ flags { packageType = maybeToFlag isLib
+  return $ flags { packageType = maybeToFlag pkgType
                  , mainIs = maybeToFlag mainFile
                  }
 
@@ -342,7 +353,16 @@ getLanguage flags = do
                   (Just Haskell2010) display True)
           ?>> return (Just Haskell2010)
 
-  return $ flags { language = maybeToFlag lang }
+  if invalidLanguage lang
+    then putStrLn invalidOtherLanguageMsg >> getLanguage flags
+    else return $ flags { language = maybeToFlag lang }
+
+  where
+    invalidLanguage (Just (UnknownLanguage t)) = any (not . isAlphaNum) t
+    invalidLanguage _ = False
+
+    invalidOtherLanguageMsg = "\nThe language must be alphanumeric. " ++
+                              "Please enter a different language."
 
 -- | Ask whether to generate explanatory comments.
 getGenComments :: InitFlags -> IO InitFlags
@@ -359,7 +379,7 @@ getSrcDir :: InitFlags -> IO InitFlags
 getSrcDir flags = do
   srcDirs <- return (sourceDirs flags)
              ?>> fmap (:[]) `fmap` guessSourceDir flags
-             ?>> fmap (fmap ((:[]) . either id id) . join) (maybePrompt
+             ?>> fmap (>>= fmap ((:[]) . either id id)) (maybePrompt
                       flags
                       (promptListOptional' "Source directory" ["src"] id))
 
@@ -376,13 +396,20 @@ guessSourceDir flags = do
              then Just "src"
              else Nothing
 
+-- | Check whether a potential source file is located in one of the
+--   source directories.
+isSourceFile :: Maybe [FilePath] -> SourceFileEntry -> Bool
+isSourceFile Nothing        sf = isSourceFile (Just ["."]) sf
+isSourceFile (Just srcDirs) sf = any (equalFilePath (relativeSourcePath sf)) srcDirs
+
 -- | Get the list of exposed modules and extra tools needed to build them.
 getModulesBuildToolsAndDeps :: InstalledPackageIndex -> InitFlags -> IO InitFlags
 getModulesBuildToolsAndDeps pkgIx flags = do
   dir <- maybe getCurrentDirectory return . flagToMaybe $ packageDir flags
 
-  -- XXX really should use guessed source roots.
-  sourceFiles <- scanForModules dir
+  sourceFiles0 <- scanForModules dir
+
+  let sourceFiles = filter (isSourceFile (sourceDirs flags)) sourceFiles0
 
   Just mods <-      return (exposedModules flags)
            ?>> (return . Just . map moduleName $ sourceFiles)
@@ -451,7 +478,7 @@ chooseDep flags (m, Just ps)
                   message flags "You will need to pick one and manually add it to the Build-depends: field."
                   return Nothing
   where
-    pkgGroups = groupBy ((==) `on` P.pkgName) (map sourcePackageId ps)
+    pkgGroups = groupBy ((==) `on` P.pkgName) (map P.packageId ps)
 
     -- Given a list of available versions of the same package, pick a dependency.
     toDep :: [P.PackageIdentifier] -> IO P.Dependency
@@ -465,14 +492,19 @@ chooseDep flags (m, Just ps)
       return $ P.Dependency (P.pkgName . head $ pids)
                             (pvpize . maximum . map P.pkgVersion $ pids)
 
-    pvpize :: Version -> VersionRange
-    pvpize v = orLaterVersion v'
-               `intersectVersionRanges`
-               earlierVersion (incVersion 1 v')
-      where v' = (v { versionBranch = take 2 (versionBranch v) })
+-- | Given a version, return an API-compatible (according to PVP) version range.
+--
+-- Example: @0.4.1@ produces the version range @>= 0.4 && < 0.5@ (which is the
+-- same as @0.4.*@).
+pvpize :: Version -> VersionRange
+pvpize v = orLaterVersion v'
+           `intersectVersionRanges`
+           earlierVersion (incVersion 1 v')
+  where v' = alterVersion (take 2) v
 
+-- | Increment the nth version component (counting from 0).
 incVersion :: Int -> Version -> Version
-incVersion n (Version vlist tags) = Version (incVersion' n vlist) tags
+incVersion n = alterVersion (incVersion' n)
   where
     incVersion' 0 []     = [1]
     incVersion' 0 (v:_)  = [v+1]
@@ -594,11 +626,6 @@ promptList' displayItem numChoices choices def other = do
                                   = return . Right $ choices !! (n-1)
                    | otherwise    = Left `fmap` promptStr "Please specify" Nothing
 
-readMaybe :: (Read a) => String -> Maybe a
-readMaybe s = case reads s of
-                [(a,"")] -> Just a
-                _        -> Nothing
-
 ---------------------------------------------------------------------------
 --  File generation  ------------------------------------------------------
 ---------------------------------------------------------------------------
@@ -616,28 +643,28 @@ writeLicense flags = do
           Flag BSD3
             -> Just $ bsd3 authors year
 
-          Flag (GPL (Just (Version {versionBranch = [2]})))
+          Flag (GPL (Just v)) | v == mkVersion [2]
             -> Just gplv2
 
-          Flag (GPL (Just (Version {versionBranch = [3]})))
+          Flag (GPL (Just v)) | v == mkVersion [3]
             -> Just gplv3
 
-          Flag (LGPL (Just (Version {versionBranch = [2, 1]})))
+          Flag (LGPL (Just v)) | v == mkVersion [2,1]
             -> Just lgpl21
 
-          Flag (LGPL (Just (Version {versionBranch = [3]})))
+          Flag (LGPL (Just v)) | v == mkVersion [3]
             -> Just lgpl3
 
-          Flag (AGPL (Just (Version {versionBranch = [3]})))
+          Flag (AGPL (Just v)) | v == mkVersion [3]
             -> Just agplv3
 
-          Flag (Apache (Just (Version {versionBranch = [2, 0]})))
+          Flag (Apache (Just v)) | v == mkVersion [2,0]
             -> Just apache20
 
           Flag MIT
             -> Just $ mit authors year
 
-          Flag (MPL (Version {versionBranch = [2, 0]}))
+          Flag (MPL v) | v == mkVersion [2,0]
             -> Just mpl20
 
           Flag ISC
@@ -668,14 +695,14 @@ writeSetupFile flags = do
     ]
 
 writeChangeLog :: InitFlags -> IO ()
-writeChangeLog flags = when (any (== defaultChangeLog) $ maybe [] id (extraSrc flags)) $ do
+writeChangeLog flags = when ((defaultChangeLog `elem`) $ fromMaybe [] (extraSrc flags)) $ do
   message flags ("Generating "++ defaultChangeLog ++"...")
   writeFileSafe flags defaultChangeLog changeLog
  where
   changeLog = unlines
     [ "# Revision history for " ++ pname
     , ""
-    , "## " ++ pver ++ "  -- YYYY-mm-dd"
+    , "## " ++ pver ++ " -- YYYY-mm-dd"
     , ""
     , "* First version. Released on an unsuspecting world."
     ]
@@ -710,17 +737,16 @@ createSourceDirectories flags = case sourceDirs flags of
 -- | Create Main.hs, but only if we are init'ing an executable and
 --   the mainIs flag has been provided.
 createMainHs :: InitFlags -> IO ()
-createMainHs flags@InitFlags{ sourceDirs = Just (srcPath:_)
-                            , packageType = Flag Executable
-                            , mainIs = Flag mainFile } =
-  writeMainHs flags (srcPath </> mainFile)
-createMainHs flags@InitFlags{ sourceDirs = _
-                            , packageType = Flag Executable
-                            , mainIs = Flag mainFile } =
-  writeMainHs flags mainFile
-createMainHs _ = return ()
+createMainHs flags =
+  if hasMainHs flags then
+    case sourceDirs flags of
+      Just (srcPath:_) -> writeMainHs flags (srcPath </> mainFile)
+      _ -> writeMainHs flags mainFile
+  else return ()
+  where
+    Flag mainFile = mainIs flags
 
--- | Write a main file if it doesn't already exist.
+--- | Write a main file if it doesn't already exist.
 writeMainHs :: InitFlags -> FilePath -> IO ()
 writeMainHs flags mainPath = do
   dir <- maybe getCurrentDirectory return (flagToMaybe $ packageDir flags)
@@ -729,6 +755,13 @@ writeMainHs flags mainPath = do
   unless exists $ do
       message flags $ "Generating " ++ mainPath ++ "..."
       writeFileSafe flags mainFullPath mainHs
+
+-- | Check that a main file exists.
+hasMainHs :: InitFlags -> Bool
+hasMainHs flags = case mainIs flags of
+  Flag _ -> (packageType flags == Flag Executable
+             || packageType flags == Flag LibraryAndExecutable)
+  _ -> False
 
 -- | Default Main.hs file.  Used when no Main.hs exists.
 mainHs :: String
@@ -768,7 +801,7 @@ findNewName oldName = findNewName' 0
 --   structure onto a low-level AST structure and use the existing
 --   pretty-printing code to generate the file.
 generateCabalFile :: String -> InitFlags -> String
-generateCabalFile fileName c =
+generateCabalFile fileName c = trimTrailingWS $
   (++ "\n") .
   renderStyle style { lineLength = 79, ribbonsPerLine = 1.1 } $
   (if minimal c /= Flag True
@@ -841,35 +874,23 @@ generateCabalFile fileName c =
                 (Just "Extra files to be distributed with the package, such as examples or a README.")
                 True
 
-       , field  "cabal-version" (Flag $ orLaterVersion (Version [1,10] []))
+       , field  "cabal-version" (Flag $ orLaterVersion (mkVersion [1,10]))
                 (Just "Constraint on the version of Cabal needed to build this package.")
                 False
 
        , case packageType c of
-           Flag Executable ->
-             text "\nexecutable" <+>
-             text (maybe "" display . flagToMaybe $ packageName c) $$
-             nest 2 (vcat
-             [ fieldS "main-is" (mainIs c) (Just ".hs or .lhs file containing the Main module.") True
-
-             , generateBuildInfo Executable c
-             ])
-           Flag Library    -> text "\nlibrary" $$ nest 2 (vcat
-             [ fieldS "exposed-modules" (listField (exposedModules c))
-                      (Just "Modules exported by the library.")
-                      True
-
-             , generateBuildInfo Library c
-             ])
+           Flag Executable -> executableStanza
+           Flag Library    -> libraryStanza
+           Flag LibraryAndExecutable -> libraryStanza $+$ executableStanza
            _               -> empty
        ]
  where
-   generateBuildInfo :: PackageType -> InitFlags -> Doc
-   generateBuildInfo pkgtype c' = vcat
+   generateBuildInfo :: BuildType -> InitFlags -> Doc
+   generateBuildInfo buildType c' = vcat
      [ fieldS "other-modules" (listField (otherModules c'))
-              (Just $ case pkgtype of
-                 Library    -> "Modules included in this library but not exported."
-                 Executable -> "Modules included in this executable, other than Main.")
+              (Just $ case buildType of
+                 LibBuild    -> "Modules included in this library but not exported."
+                 ExecBuild -> "Modules included in this executable, other than Main.")
               True
 
      , fieldS "other-extensions" (listField (otherExts c'))
@@ -915,9 +936,9 @@ generateCabalFile fileName c =
                         (True, _, _)      -> (showComment com $$) . ($$ text "")
                         (False, _, _)     -> ($$ text "")
                       $
-                      comment f <> text s <> colon
-                                <> text (replicate (20 - length s) ' ')
-                                <> text (fromMaybe "" . flagToMaybe $ f)
+                      comment f <<>> text s <<>> colon
+                                <<>> text (replicate (20 - length s) ' ')
+                                <<>> text (fromMaybe "" . flagToMaybe $ f)
    comment NoFlag    = text "-- "
    comment (Flag "") = text "-- "
    comment _         = text ""
@@ -939,6 +960,28 @@ generateCabalFile fileName c =
    breakLine  cs = case break (==' ') cs of (w,cs') -> w : breakLine' cs'
    breakLine' [] = []
    breakLine' cs = case span (==' ') cs of (w,cs') -> w : breakLine cs'
+
+   trimTrailingWS :: String -> String
+   trimTrailingWS = unlines . map (dropWhileEndLE isSpace) . lines
+
+   executableStanza :: Doc
+   executableStanza = text "\nexecutable" <+>
+             text (maybe "" display . flagToMaybe $ packageName c) $$
+             nest 2 (vcat
+             [ fieldS "main-is" (mainIs c) (Just ".hs or .lhs file containing the Main module.") True
+
+             , generateBuildInfo ExecBuild c
+             ])
+
+   libraryStanza :: Doc
+   libraryStanza = text "\nlibrary" $$ nest 2 (vcat
+             [ fieldS "exposed-modules" (listField (exposedModules c))
+                      (Just "Modules exported by the library.")
+                      True
+
+             , generateBuildInfo LibBuild c
+             ])
+
 
 -- | Generate warnings for missing fields etc.
 generateWarnings :: InitFlags -> IO ()

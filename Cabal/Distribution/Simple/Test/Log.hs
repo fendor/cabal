@@ -1,3 +1,6 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Distribution.Simple.Test.Log
        ( PackageLog(..)
        , TestLogs(..)
@@ -11,21 +14,21 @@ module Distribution.Simple.Test.Log
        , testSuiteLogPath
        ) where
 
-import Distribution.Package ( PackageId )
-import qualified Distribution.PackageDescription as PD
-import Distribution.Simple.Compiler ( Compiler(..), compilerInfo, CompilerId )
-import Distribution.Simple.InstallDirs
-    ( fromPathTemplate, initialPathTemplateEnv, PathTemplateVariable(..)
-    , substPathTemplate , toPathTemplate, PathTemplate )
-import qualified Distribution.Simple.LocalBuildInfo as LBI
-import Distribution.Simple.Setup ( TestShowDetails(..) )
-import Distribution.Simple.Utils ( notice )
-import Distribution.System ( Platform )
-import Distribution.TestSuite ( Options, Result(..) )
-import Distribution.Verbosity ( Verbosity )
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Control.Monad ( when )
-import Data.Char ( toUpper )
+import Distribution.Package
+import Distribution.Types.UnqualComponentName
+import qualified Distribution.PackageDescription as PD
+import Distribution.Simple.Compiler
+import Distribution.Simple.InstallDirs
+import qualified Distribution.Simple.LocalBuildInfo as LBI
+import Distribution.Simple.Setup
+import Distribution.Simple.Utils
+import Distribution.System
+import Distribution.TestSuite
+import Distribution.Verbosity
+import Distribution.Text
 
 -- | Logs all test results for a package, broken down first by test suite and
 -- then by test case.
@@ -48,7 +51,7 @@ localPackageLog pkg_descr lbi = PackageLog
 
 -- | Logs test suite results, itemized by test case.
 data TestSuiteLog = TestSuiteLog
-    { testSuiteName :: String
+    { testSuiteName :: UnqualComponentName
     , testLogs :: TestLogs
     , logFile :: FilePath    -- path to human-readable log file
     }
@@ -109,13 +112,13 @@ testSuiteLogPath :: PathTemplate
                  -> String -- ^ test suite name
                  -> TestLogs -- ^ test suite results
                  -> FilePath
-testSuiteLogPath template pkg_descr lbi name result =
+testSuiteLogPath template pkg_descr lbi test_name result =
     fromPathTemplate $ substPathTemplate env template
     where
         env = initialPathTemplateEnv
-                (PD.package pkg_descr) (LBI.localLibraryName lbi)
+                (PD.package pkg_descr) (LBI.localUnitId lbi)
                 (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi)
-                ++  [ (TestSuiteNameVar, toPathTemplate name)
+                ++  [ (TestSuiteNameVar, toPathTemplate test_name)
                     , (TestSuiteResultVar, toPathTemplate $ resultString result)
                     ]
 
@@ -152,7 +155,7 @@ summarizeTest verbosity details t =
 -- output for certain verbosity or test filter levels.
 summarizeSuiteFinish :: TestSuiteLog -> String
 summarizeSuiteFinish testLog = unlines
-    [ "Test suite " ++ testSuiteName testLog ++ ": " ++ resStr
+    [ "Test suite " ++ display (testSuiteName testLog) ++ ": " ++ resStr
     , "Test suite logged to: " ++ logFile testLog
     ]
     where resStr = map toUpper (resultString $ testLogs testLog)

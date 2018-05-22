@@ -1,5 +1,5 @@
 
-VERSION=1.23.0.0
+VERSION=2.3.0.0
 
 #KIND=devel
 KIND=rc
@@ -14,7 +14,10 @@ all: build
 
 # build the library itself
 
-SOURCES=Distribution/*.hs Distribution/Simple/*.hs Distribution/PackageDescription/*.hs Distribution/Simple/GHC/*.hs Distribution/Simple/Build/*.hs Distribution/Compat/*.hs Distribution/Simple/Program/*.hs
+SOURCES=Distribution/*.hs Distribution/Simple/*.hs \
+	Distribution/PackageDescription/*.hs Distribution/Simple/GHC/*.hs \
+	Distribution/Simple/Build/*.hs Distribution/Compat/*.hs \
+	Distribution/Simple/Program/*.hs
 CONFIG_STAMP=dist/setup-config
 BUILD_STAMP=dist/build/libHSCabal-$(VERSION).a
 HADDOCK_STAMP=dist/doc/html/Cabal/index.html
@@ -22,12 +25,21 @@ USERGUIDE_STAMP=dist/doc/users-guide/index.html
 SDIST_STAMP=dist/Cabal-$(VERSION).tar.gz
 DISTLOC=dist/release
 DIST_STAMP=$(DISTLOC)/Cabal-$(VERSION).tar.gz
+SPHINXCMD:=$(shell command -v sphinx-build2 2> /dev/null)
+ifndef SPHINXCMD
+	SPHINXCMD:=$(shell command -v sphinx-build 2> /dev/null)
+endif
+ifndef SPHINXCMD
+	$(error "needs sphinx-build")
+endif
+
 
 COMMA=,
 
 setup: $(SOURCES) Setup.hs
 	-mkdir -p dist/setup
-	$(HC) $(GHCFLAGS) --make -i. -odir dist/setup -hidir dist/setup Setup.hs -o setup
+	$(HC) $(GHCFLAGS) --make -i. -odir dist/setup -hidir dist/setup Setup.hs \
+		-o setup
 
 $(CONFIG_STAMP): setup Cabal.cabal
 	./setup configure --with-compiler=$(HC) --prefix=$(PREFIX)
@@ -45,22 +57,12 @@ haddock: $(HADDOCK_STAMP)
 $(HADDOCK_STAMP) : $(CONFIG_STAMP) $(BUILD_STAMP)
 	./setup haddock
 
-PANDOC=pandoc
-PANDOC_OPTIONS= \
-	--standalone \
-	--smart \
-	--css=$(PANDOC_HTML_CSS)
-PANDOC_HTML_OUTDIR=dist/doc/users-guide
-PANDOC_HTML_CSS=Cabal.css
+SPHINX_HTML_OUTDIR=dist/doc/users-guide
 
-users-guide: $(USERGUIDE_STAMP) doc/*.markdown
-$(USERGUIDE_STAMP): doc/*.markdown
-	mkdir -p $(PANDOC_HTML_OUTDIR)
-	for file in $^; do \
-		[ $${file} != doc/index.markdown ] && TOC=--table-of-contents || TOC=; \
-		$(PANDOC) $(PANDOC_OPTIONS) $${TOC} --from=markdown --to=html --output $(PANDOC_HTML_OUTDIR)/$$(basename $${file} .markdown).html $${file}; \
-	done
-	cp doc/$(PANDOC_HTML_CSS) $(PANDOC_HTML_OUTDIR)
+users-guide: $(USERGUIDE_STAMP)
+$(USERGUIDE_STAMP) : doc/*.rst
+	mkdir -p $(SPHINX_HTML_OUTDIR)
+	$(SPHINXCMD) doc $(SPHINX_HTML_OUTDIR)
 
 docs: haddock users-guide
 
@@ -100,16 +102,19 @@ $(DIST_STAMP) : $(HADDOCK_STAMP) $(USERGUIDE_STAMP) $(SDIST_STAMP)
 	cp -r dist/doc/html $(DISTLOC)/Cabal-$(VERSION)/doc/API
 	cp -r dist/doc/users-guide $(DISTLOC)/Cabal-$(VERSION)/doc/
 	cp changelog $(DISTLOC)/Cabal-$(VERSION)/
-	tar -C $(DISTLOC) -czf $(DISTLOC)/Cabal-$(VERSION).tar.gz Cabal-$(VERSION)
-	mv $(DISTLOC)/Cabal-$(VERSION)/doc $(DISTLOC)/
+	tar --format=ustar -C $(DISTLOC) -czf $(DISTLOC)/Cabal-$(VERSION).tar.gz Cabal-$(VERSION)
+	mkdir $(DISTLOC)/doc
+	mv $(DISTLOC)/Cabal-$(VERSION)/doc/users-guide $(DISTLOC)/doc
+	mv $(DISTLOC)/Cabal-$(VERSION)/doc/API $(DISTLOC)/doc
 	mv $(DISTLOC)/Cabal-$(VERSION)/changelog $(DISTLOC)/
 	rm -r $(DISTLOC)/Cabal-$(VERSION)/
 	@echo "Cabal tarball built: $(DIST_STAMP)"
 	@echo "Release fileset prepared: $(DISTLOC)/"
 
-release: $(DIST_STAMP)
-	scp -r $(DISTLOC) $(SSH_USER)@haskell.org:/home/web/haskell.org/cabal/release/cabal-$(VERSION)
-	ssh $(SSH_USER)@haskell.org 'cd /home/web/haskell.org/cabal/release && rm -f $(KIND) && ln -s cabal-$(VERSION) $(KIND)'
+# Out of date, use SFTP
+#release: $(DIST_STAMP)
+#	scp -r $(DISTLOC) $(SSH_USER)@haskell.org:/home/web/haskell.org/cabal/release/cabal-$(VERSION)
+#	ssh $(SSH_USER)@haskell.org 'cd /home/web/haskell.org/cabal/release && rm -f $(KIND) && ln -s cabal-$(VERSION) $(KIND)'
 
 # tags...
 

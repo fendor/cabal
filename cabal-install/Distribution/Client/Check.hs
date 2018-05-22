@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Check
@@ -15,22 +16,42 @@ module Distribution.Client.Check (
     check
   ) where
 
-import Control.Monad ( when, unless )
+import Distribution.Client.Compat.Prelude
+import Prelude ()
 
-import Distribution.PackageDescription.Parse
-         ( readPackageDescription )
+import Distribution.PackageDescription               (GenericPackageDescription)
 import Distribution.PackageDescription.Check
-import Distribution.PackageDescription.Configuration
-         ( flattenPackageDescription )
-import Distribution.Verbosity
-         ( Verbosity )
-import Distribution.Simple.Utils
-         ( defaultPackageDesc, toUTF8, wrapText )
+import Distribution.PackageDescription.Configuration (flattenPackageDescription)
+import Distribution.PackageDescription.Parsec
+       (parseGenericPackageDescription, runParseResult)
+import Distribution.Parsec.Common                    (PWarning (..), showPError, showPWarning)
+import Distribution.Simple.Utils                     (defaultPackageDesc, die', warn, wrapText)
+import Distribution.Verbosity                        (Verbosity)
+
+import qualified Data.ByteString  as BS
+import qualified System.Directory as Dir
+
+readGenericPackageDescriptionCheck :: Verbosity -> FilePath -> IO ([PWarning], GenericPackageDescription)
+readGenericPackageDescriptionCheck verbosity fpath = do
+    exists <- Dir.doesFileExist fpath
+    unless exists $
+      die' verbosity $
+        "Error Parsing: file \"" ++ fpath ++ "\" doesn't exist. Cannot continue."
+    bs <- BS.readFile fpath
+    let (warnings, result) = runParseResult (parseGenericPackageDescription bs)
+    case result of
+        Left (_, errors) -> do
+            traverse_ (warn verbosity . showPError fpath) errors
+            die' verbosity $ "Failed parsing \"" ++ fpath ++ "\"."
+        Right x  -> return (warnings, x)
 
 check :: Verbosity -> IO Bool
 check verbosity = do
     pdfile <- defaultPackageDesc verbosity
-    ppd <- readPackageDescription verbosity pdfile
+    (ws, ppd) <- readGenericPackageDescriptionCheck verbosity pdfile
+    -- convert parse warnings into PackageChecks
+    -- Note: we /could/ pick different levels, based on warning type.
+    let ws' = [ PackageDistSuspicious (showPWarning pdfile w) | w <- ws ]
     -- flatten the generic package description into a regular package
     -- description
     -- TODO: this may give more warnings than it should give;
@@ -46,7 +67,7 @@ check verbosity = do
     --      the exact same errors as it will.
     let pkg_desc = flattenPackageDescription ppd
     ioChecks <- checkPackageFiles pkg_desc "."
-    let packageChecks = ioChecks ++ checkPackage ppd (Just pkg_desc)
+    let packageChecks = ioChecks ++ checkPackage ppd (Just pkg_desc) ++ ws'
         buildImpossible = [ x | x@PackageBuildImpossible {} <- packageChecks ]
         buildWarning    = [ x | x@PackageBuildWarning {}    <- packageChecks ]
         distSuspicious  = [ x | x@PackageDistSuspicious {}  <- packageChecks ]
@@ -58,7 +79,7 @@ check verbosity = do
         printCheckMessages buildImpossible
 
     unless (null buildWarning) $ do
-        putStrLn "The following warnings are likely affect your build negatively:"
+        putStrLn "The following warnings are likely to affect your build negatively:"
         printCheckMessages buildWarning
 
     unless (null distSuspicious) $ do
@@ -82,8 +103,8 @@ check verbosity = do
     when (null packageChecks) $
         putStrLn "No errors or warnings could be found in the package."
 
-    return (null . filter isCheckError $ packageChecks)
+    return (not . any isCheckError $ packageChecks)
 
   where
-    printCheckMessages = mapM_ (putStrLn . format . explanation)
-    format = toUTF8 . wrapText . ("* "++)
+    printCheckMessages = traverse_ (putStrLn . format . explanation)
+    format = wrapText . ("* "++)

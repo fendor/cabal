@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE GADTs #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Compat.ReadP
@@ -38,12 +38,14 @@ module Distribution.Compat.ReadP
 
   -- * Other operations
   pfail,      -- :: ReadP a
+  eof,        -- :: ReadP ()
   satisfy,    -- :: (Char -> Bool) -> ReadP Char
   char,       -- :: Char -> ReadP Char
   string,     -- :: String -> ReadP String
   munch,      -- :: (Char -> Bool) -> ReadP String
   munch1,     -- :: (Char -> Bool) -> ReadP String
   skipSpaces, -- :: ReadP ()
+  skipSpaces1,-- :: ReadP ()
   choice,     -- :: [ReadP a] -> ReadP a
   count,      -- :: Int -> ReadP a -> ReadP [a]
   between,    -- :: ReadP open -> ReadP close -> ReadP a -> ReadP a
@@ -66,16 +68,19 @@ module Distribution.Compat.ReadP
   -- * Running a parser
   ReadS,      -- :: *; = String -> [(a,String)]
   readP_to_S, -- :: ReadP a -> ReadS a
-  readS_to_P  -- :: ReadS a -> ReadP a
+  readS_to_P, -- :: ReadS a -> ReadP a
+
+  -- ** Internal
+  Parser,
   )
  where
 
-import Control.Monad( MonadPlus(..), liftM, liftM2, ap )
-import Data.Char (isSpace)
-#if __GLASGOW_HASKELL__ < 710
-import Control.Applicative (Applicative(..))
-#endif
-import Control.Applicative (Alternative(empty, (<|>)))
+import Prelude ()
+import Distribution.Compat.Prelude hiding (many, get)
+
+import qualified Distribution.Compat.MonadFail as Fail
+
+import Control.Monad( replicateM, (>=>) )
 
 infixr 5 +++, <++
 
@@ -96,18 +101,21 @@ instance Functor (P s) where
   fmap = liftM
 
 instance Applicative (P s) where
-  pure = return
+  pure x = Result x Fail
   (<*>) = ap
 
 instance Monad (P s) where
-  return x = Result x Fail
+  return = pure
 
-  (Get f)      >>= k = Get (\c -> f c >>= k)
-  (Look f)     >>= k = Look (\s -> f s >>= k)
+  (Get f)      >>= k = Get (f >=> k)
+  (Look f)     >>= k = Look (f >=> k)
   Fail         >>= _ = Fail
   (Result x p) >>= k = k x `mplus` (p >>= k)
   (Final r)    >>= k = final [ys' | (x,s) <- r, ys' <- run (k x) s]
 
+  fail = Fail.fail
+
+instance Fail.MonadFail (P s) where
   fail _ = Fail
 
 instance Alternative (P s) where
@@ -155,17 +163,24 @@ instance Functor (Parser r s) where
   fmap h (R f) = R (\k -> f (k . h))
 
 instance Applicative (Parser r s) where
-  pure = return
+  pure x  = R (\k -> k x)
   (<*>) = ap
 
+instance s ~ Char => Alternative (Parser r s) where
+  empty = pfail
+  (<|>) = (+++)
+
 instance Monad (Parser r s) where
-  return x  = R (\k -> k x)
-  fail _    = R (\_ -> Fail)
+  return = pure
+  fail = Fail.fail
   R m >>= f = R (\k -> m (\a -> let R m' = f a in m' k))
 
---instance MonadPlus (Parser r s) where
---  mzero = pfail
---  mplus = (+++)
+instance Fail.MonadFail (Parser r s) where
+  fail _    = R (const Fail)
+
+instance s ~ Char => MonadPlus (Parser r s) where
+  mzero = pfail
+  mplus = (+++)
 
 -- ---------------------------------------------------------------------------
 -- Operations over P
@@ -197,7 +212,13 @@ look = R Look
 
 pfail :: ReadP r a
 -- ^ Always fails.
-pfail = R (\_ -> Fail)
+pfail = R (const Fail)
+
+eof :: ReadP r ()
+-- ^ Succeeds iff we are at the end of input
+eof = do { s <- look
+         ; if null s then return ()
+                     else pfail }
 
 (+++) :: ReadP r a -> ReadP r a -> ReadP r a
 -- ^ Symmetric choice.
@@ -230,7 +251,7 @@ gather (R m) =
  where
   gath l (Get f)      = Get (\c -> gath (l.(c:)) (f c))
   gath _ Fail         = Fail
-  gath l (Look f)     = Look (\s -> gath l (f s))
+  gath l (Look f)     = Look (gath l . f)
   gath l (Result k p) = k (l []) `mplus` gath l p
   gath _ (Final _)    = error "do not use readS_to_P in gather!"
 
@@ -250,9 +271,9 @@ string :: String -> ReadP r String
 -- ^ Parses and returns the specified string.
 string this = do s <- look; scan this s
  where
-  scan []     _               = do return this
-  scan (x:xs) (y:ys) | x == y = do get >> scan xs ys
-  scan _      _               = do pfail
+  scan []     _               = return this
+  scan (x:xs) (y:ys) | x == y = get >> scan xs ys
+  scan _      _               = pfail
 
 munch :: (Char -> Bool) -> ReadP r String
 -- ^ Parses the first zero or more characters satisfying the predicate.
@@ -285,10 +306,15 @@ skipSpaces =
   skip (c:s) | isSpace c = do _ <- get; skip s
   skip _                 = do return ()
 
+skipSpaces1 :: ReadP r ()
+-- ^ Like 'skipSpaces' but succeeds only if there is at least one
+-- whitespace character to skip.
+skipSpaces1 = satisfy isSpace >> skipSpaces
+
 count :: Int -> ReadP r a -> ReadP r [a]
 -- ^ @ count n p @ parses @n@ occurrences of @p@ in sequence. A list of
 --   results is returned.
-count n p = sequence (replicate n p)
+count n p = replicateM n p
 
 between :: ReadP r open -> ReadP r close -> ReadP r a -> ReadP r a
 -- ^ @ between open close p @ parses @open@, followed by @p@ and finally

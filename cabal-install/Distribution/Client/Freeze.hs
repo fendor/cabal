@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Freeze
@@ -13,42 +12,47 @@
 -- The cabal freeze command
 -----------------------------------------------------------------------------
 module Distribution.Client.Freeze (
-    freeze,
+    freeze, getFreezePkgs
   ) where
+
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
 import Distribution.Client.Config ( SavedConfig(..) )
 import Distribution.Client.Types
 import Distribution.Client.Targets
 import Distribution.Client.Dependency
-import Distribution.Client.Dependency.Types
-         ( ConstraintSource(..), LabeledPackageConstraint(..) )
 import Distribution.Client.IndexUtils as IndexUtils
          ( getSourcePackages, getInstalledPackages )
-import Distribution.Client.InstallPlan
-         ( InstallPlan, PlanPackage )
-import qualified Distribution.Client.InstallPlan as InstallPlan
+import Distribution.Client.SolverInstallPlan
+         ( SolverInstallPlan, SolverPlanPackage )
+import qualified Distribution.Client.SolverInstallPlan as SolverInstallPlan
 import Distribution.Client.Setup
-         ( GlobalFlags(..), FreezeFlags(..), ConfigExFlags(..) )
-import Distribution.Client.HttpUtils
-         ( configureTransport )
+         ( GlobalFlags(..), FreezeFlags(..), ConfigExFlags(..)
+         , RepoContext(..) )
 import Distribution.Client.Sandbox.PackageEnvironment
          ( loadUserConfig, pkgEnvSavedConfig, showPackageEnvironment,
            userPackageEnvironmentFile )
 import Distribution.Client.Sandbox.Types
          ( SandboxPackageInfo(..) )
 
+import Distribution.Solver.Types.ConstraintSource
+import Distribution.Solver.Types.LabeledPackageConstraint
+import Distribution.Solver.Types.OptionalStanza
+import Distribution.Solver.Types.PkgConfigDb
+import Distribution.Solver.Types.SolverId
+
 import Distribution.Package
          ( Package, packageId, packageName, packageVersion )
 import Distribution.Simple.Compiler
          ( Compiler, compilerInfo, PackageDBStack )
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
-import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.Program
-         ( ProgramConfiguration )
+         ( ProgramDb )
 import Distribution.Simple.Setup
          ( fromFlag, fromFlagOrDefault, flagToMaybe )
 import Distribution.Simple.Utils
-         ( die, notice, debug, writeFileAtomic )
+         ( die', notice, debug, writeFileAtomic )
 import Distribution.System
          ( Platform )
 import Distribution.Text
@@ -56,15 +60,7 @@ import Distribution.Text
 import Distribution.Verbosity
          ( Verbosity )
 
-import Control.Monad
-         ( when )
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid
-         ( mempty )
-#endif
-import Data.Version
-         ( showVersion )
 import Distribution.Version
          ( thisVersion )
 
@@ -76,33 +72,21 @@ import Distribution.Version
 -- constraining each dependency to an exact version.
 --
 freeze :: Verbosity
-      -> PackageDBStack
-      -> [Repo]
-      -> Compiler
-      -> Platform
-      -> ProgramConfiguration
-      -> Maybe SandboxPackageInfo
-      -> GlobalFlags
-      -> FreezeFlags
-      -> IO ()
-freeze verbosity packageDBs repos comp platform conf mSandboxPkgInfo
+       -> PackageDBStack
+       -> RepoContext
+       -> Compiler
+       -> Platform
+       -> ProgramDb
+       -> Maybe SandboxPackageInfo
+       -> GlobalFlags
+       -> FreezeFlags
+       -> IO ()
+freeze verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
       globalFlags freezeFlags = do
 
-    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
-    sourcePkgDb       <- getSourcePackages    verbosity repos
-
-    transport <- configureTransport verbosity
-                 (flagToMaybe (globalHttpTransport globalFlags))
-
-    pkgSpecifiers <- resolveUserTargets verbosity transport
-                       (fromFlag $ globalWorldFile globalFlags)
-                       (packageIndex sourcePkgDb)
-                       [UserTargetLocalDir "."]
-
-    sanityCheck pkgSpecifiers
-    pkgs  <- planPackages
-               verbosity comp platform mSandboxPkgInfo freezeFlags
-               installedPkgIndex sourcePkgDb pkgSpecifiers
+    pkgs  <- getFreezePkgs
+               verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+               globalFlags freezeFlags
 
     if null pkgs
       then notice verbosity $ "No packages to be frozen. "
@@ -112,17 +96,46 @@ freeze verbosity packageDBs repos comp platform conf mSandboxPkgInfo
                      "The following packages would be frozen:"
                    : formatPkgs pkgs
 
-             else freezePackages verbosity pkgs
+             else freezePackages verbosity globalFlags pkgs
 
   where
     dryRun = fromFlag (freezeDryRun freezeFlags)
 
+-- | Get the list of packages whose versions would be frozen by the @freeze@
+-- command.
+getFreezePkgs :: Verbosity
+              -> PackageDBStack
+              -> RepoContext
+              -> Compiler
+              -> Platform
+              -> ProgramDb
+              -> Maybe SandboxPackageInfo
+              -> GlobalFlags
+              -> FreezeFlags
+              -> IO [SolverPlanPackage]
+getFreezePkgs verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
+      globalFlags freezeFlags = do
+
+    installedPkgIndex <- getInstalledPackages verbosity comp packageDBs progdb
+    sourcePkgDb       <- getSourcePackages    verbosity repoCtxt
+    pkgConfigDb       <- readPkgConfigDb      verbosity progdb
+
+    pkgSpecifiers <- resolveUserTargets verbosity repoCtxt
+                       (fromFlag $ globalWorldFile globalFlags)
+                       (packageIndex sourcePkgDb)
+                       [UserTargetLocalDir "."]
+
+    sanityCheck pkgSpecifiers
+    planPackages
+               verbosity comp platform mSandboxPkgInfo freezeFlags
+               installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers
+  where
     sanityCheck pkgSpecifiers = do
       when (not . null $ [n | n@(NamedPackage _ _) <- pkgSpecifiers]) $
-        die $ "internal error: 'resolveUserTargets' returned "
+        die' verbosity $ "internal error: 'resolveUserTargets' returned "
            ++ "unexpected named package specifiers!"
       when (length pkgSpecifiers /= 1) $
-        die $ "internal error: 'resolveUserTargets' returned "
+        die' verbosity $ "internal error: 'resolveUserTargets' returned "
            ++ "unexpected source package specifiers!"
 
 planPackages :: Verbosity
@@ -132,18 +145,19 @@ planPackages :: Verbosity
              -> FreezeFlags
              -> InstalledPackageIndex
              -> SourcePackageDb
-             -> [PackageSpecifier SourcePackage]
-             -> IO [PlanPackage]
+             -> PkgConfigDb
+             -> [PackageSpecifier UnresolvedSourcePackage]
+             -> IO [SolverPlanPackage]
 planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
-             installedPkgIndex sourcePkgDb pkgSpecifiers = do
+             installedPkgIndex sourcePkgDb pkgConfigDb pkgSpecifiers = do
 
   solver <- chooseSolver verbosity
             (fromFlag (freezeSolver freezeFlags)) (compilerInfo comp)
   notice verbosity "Resolving dependencies..."
 
-  installPlan <- foldProgress logMsg die return $
+  installPlan <- foldProgress logMsg (die' verbosity) return $
                    resolveDependencies
-                     platform (compilerInfo comp)
+                     platform (compilerInfo comp) pkgConfigDb
                      solver
                      resolverParams
 
@@ -159,13 +173,20 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 
       . setReorderGoals reorderGoals
 
+      . setCountConflicts countConflicts
+
       . setShadowPkgs shadowPkgs
 
       . setStrongFlags strongFlags
 
+      . setAllowBootLibInstalls allowBootLibInstalls
+
+      . setSolverVerbosity verbosity
+
       . addConstraints
           [ let pkg = pkgSpecifierTarget pkgSpecifier
-                pc = PackageConstraintStanzas pkg stanzas
+                pc = PackageConstraint (scopeToplevel pkg)
+                                       (PackagePropertyStanzas stanzas)
             in LabeledPackageConstraint pc ConstraintSourceFreeze
           | pkgSpecifier <- pkgSpecifiers ]
 
@@ -175,18 +196,18 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 
     logMsg message rest = debug verbosity message >> rest
 
-    stanzas = concat
-        [ if testsEnabled      then [TestStanzas]  else []
-        , if benchmarksEnabled then [BenchStanzas] else []
-        ]
+    stanzas = [ TestStanzas | testsEnabled ]
+           ++ [ BenchStanzas | benchmarksEnabled ]
     testsEnabled      = fromFlagOrDefault False $ freezeTests freezeFlags
     benchmarksEnabled = fromFlagOrDefault False $ freezeBenchmarks freezeFlags
 
     reorderGoals     = fromFlag (freezeReorderGoals     freezeFlags)
+    countConflicts   = fromFlag (freezeCountConflicts   freezeFlags)
     independentGoals = fromFlag (freezeIndependentGoals freezeFlags)
     shadowPkgs       = fromFlag (freezeShadowPkgs       freezeFlags)
     strongFlags      = fromFlag (freezeStrongFlags      freezeFlags)
     maxBackjumps     = fromFlag (freezeMaxBackjumps     freezeFlags)
+    allowBootLibInstalls = fromFlag (freezeAllowBootLibInstalls freezeFlags)
 
 
 -- | Remove all unneeded packages from an install plan.
@@ -198,25 +219,29 @@ planPackages verbosity comp platform mSandboxPkgInfo freezeFlags
 -- 2) not a dependency (directly or transitively) of the package we are
 --    freezing.  This is useful for removing previously installed packages
 --    which are no longer required from the install plan.
-pruneInstallPlan :: InstallPlan
-                 -> [PackageSpecifier SourcePackage]
-                 -> [PlanPackage]
+--
+-- Invariant: @pkgSpecifiers@ must refer to packages which are not
+-- 'PreExisting' in the 'SolverInstallPlan'.
+pruneInstallPlan :: SolverInstallPlan
+                 -> [PackageSpecifier UnresolvedSourcePackage]
+                 -> [SolverPlanPackage]
 pruneInstallPlan installPlan pkgSpecifiers =
-    either (const brokenPkgsErr)
-           (removeSelf pkgIds . PackageIndex.allPackages) $
-    InstallPlan.dependencyClosure installPlan pkgIds
+    removeSelf pkgIds $
+    SolverInstallPlan.dependencyClosure installPlan pkgIds
   where
-    pkgIds = [ packageId pkg | SpecificSourcePackage pkg <- pkgSpecifiers ]
-    removeSelf [thisPkg] = filter (\pp -> packageId pp /= thisPkg)
+    pkgIds = [ PlannedId (packageId pkg)
+             | SpecificSourcePackage pkg <- pkgSpecifiers ]
+    removeSelf [thisPkg] = filter (\pp -> packageId pp /= packageId thisPkg)
     removeSelf _  = error $ "internal error: 'pruneInstallPlan' given "
                          ++ "unexpected package specifiers!"
-    brokenPkgsErr = error "planPackages: installPlan contains broken packages"
 
 
-freezePackages :: Package pkg => Verbosity -> [pkg] -> IO ()
-freezePackages verbosity pkgs = do
+freezePackages :: Package pkg => Verbosity -> GlobalFlags -> [pkg] -> IO ()
+freezePackages verbosity globalFlags pkgs = do
+
     pkgEnv <- fmap (createPkgEnv . addFrozenConstraints) $
                    loadUserConfig verbosity ""
+                   (flagToMaybe . globalConstraintsFile $ globalFlags)
     writeFileAtomic userPackageEnvironmentFile $ showPkgEnv pkgEnv
   where
     addFrozenConstraints config =
@@ -226,11 +251,12 @@ freezePackages verbosity pkgs = do
             }
         }
     constraint pkg =
-        (pkgIdToConstraint $ packageId pkg, ConstraintSourceUserConfig)
+        (pkgIdToConstraint $ packageId pkg
+        ,ConstraintSourceUserConfig userPackageEnvironmentFile)
       where
         pkgIdToConstraint pkgId =
-            UserConstraintVersion (packageName pkgId)
-                                  (thisVersion $ packageVersion pkgId)
+            UserConstraint (UserQualified UserQualToplevel (packageName pkgId))
+                           (PackagePropertyVersion $ thisVersion (packageVersion pkgId))
     createPkgEnv config = mempty { pkgEnvSavedConfig = config }
     showPkgEnv = BS.Char8.pack . showPackageEnvironment
 
@@ -240,4 +266,4 @@ formatPkgs = map $ showPkg . packageId
   where
     showPkg pid = name pid ++ " == " ++ version pid
     name = display . packageName
-    version = showVersion . packageVersion
+    version = display . packageVersion

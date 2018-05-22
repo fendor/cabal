@@ -16,13 +16,11 @@ module Distribution.Simple.Program.Script (
     invocationAsBatchFile,
   ) where
 
-import Distribution.Simple.Program.Run
-         ( ProgramInvocation(..) )
-import Distribution.System
-         ( OS(..) )
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Data.Maybe
-         ( maybeToList )
+import Distribution.Simple.Program.Run
+import Distribution.System
 
 -- | Generate a system script, either POSIX shell script or Windows batch file
 -- as appropriate for the given system.

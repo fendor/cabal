@@ -1,4 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -32,17 +35,14 @@ module Distribution.Simple.Program.Types (
     simpleConfiguredProgram,
   ) where
 
-import Distribution.Simple.Program.Find
-         ( ProgramSearchPath, ProgramSearchPathEntry(..)
-         , findProgramOnSearchPath )
-import Distribution.Version
-         ( Version )
-import Distribution.Verbosity
-         ( Verbosity )
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Distribution.Compat.Binary (Binary)
+import Distribution.Simple.Program.Find
+import Distribution.Version
+import Distribution.Verbosity
+
 import qualified Data.Map as Map
-import GHC.Generics (Generic)
 
 -- | Represents a program which can be configured.
 --
@@ -59,8 +59,13 @@ data Program = Program {
        --
        -- It is supplied with the prevailing search path which will typically
        -- just be used as-is, but can be extended or ignored as needed.
+       --
+       -- For the purpose of change monitoring, in addition to the location
+       -- where the program was found, it returns all the other places that
+       -- were tried.
+       --
        programFindLocation :: Verbosity -> ProgramSearchPath
-                              -> IO (Maybe FilePath),
+                              -> IO (Maybe (FilePath, [FilePath])),
 
        -- | Try to find the version of the program. For many programs this is
        -- not possible or is not necessary so it's OK to return Nothing.
@@ -71,6 +76,8 @@ data Program = Program {
        -- it could add args, or environment vars.
        programPostConf :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
      }
+instance Show Program where
+  show (Program name _ _ _) = "Program: " ++ name
 
 type ProgArg = String
 
@@ -108,8 +115,17 @@ data ConfiguredProgram = ConfiguredProgram {
        programProperties :: Map.Map String String,
 
        -- | Location of the program. eg. @\/usr\/bin\/ghc-6.4@
-       programLocation :: ProgramLocation
-     } deriving (Eq, Generic, Read, Show)
+       programLocation :: ProgramLocation,
+
+       -- | In addition to the 'programLocation' where the program was found,
+       -- these are additional locations that were looked at. The combination
+       -- of ths found location and these not-found locations can be used to
+       -- monitor to detect when the re-configuring the program might give a
+       -- different result (e.g. found in a different location).
+       --
+       programMonitorFiles :: [FilePath]
+     }
+  deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Binary ConfiguredProgram
 
@@ -138,7 +154,7 @@ suppressOverrideArgs prog = prog { programOverrideArgs = [] }
 -- By default we'll just search for it in the path and not try to find the
 -- version name. You can override these behaviours if necessary, eg:
 --
--- > simpleProgram "foo" { programFindLocation = ... , programFindVersion ... }
+-- > (simpleProgram "foo") { programFindLocation = ... , programFindVersion ... }
 --
 simpleProgram :: String -> Program
 simpleProgram name = Program {
@@ -160,5 +176,6 @@ simpleConfiguredProgram name loc = ConfiguredProgram {
      programOverrideArgs = [],
      programOverrideEnv  = [],
      programProperties   = Map.empty,
-     programLocation     = loc
+     programLocation     = loc,
+     programMonitorFiles = [] -- did not look in any other locations
   }

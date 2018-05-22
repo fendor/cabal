@@ -1,4 +1,5 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Sandbox.PackageEnvironment
@@ -11,7 +12,6 @@
 
 module Distribution.Client.Sandbox.PackageEnvironment (
     PackageEnvironment(..)
-  , IncludeComments(..)
   , PackageEnvironmentType(..)
   , classifyPackageEnvironment
   , createPackageEnvironmentFile
@@ -36,12 +36,12 @@ import Distribution.Client.Config      ( SavedConfig(..), commentSavedConfig
                                        , installDirsFields, withProgramsFields
                                        , withProgramOptionsFields
                                        , defaultCompiler )
-import Distribution.Client.Dependency.Types ( ConstraintSource (..) )
 import Distribution.Client.ParseUtils  ( parseFields, ppFields, ppSection )
 import Distribution.Client.Setup       ( GlobalFlags(..), ConfigExFlags(..)
                                        , InstallFlags(..)
                                        , defaultSandboxLocation )
-import Distribution.Utils.NubList            ( toNubList )
+import Distribution.Client.Targets     ( userConstraintPackageName )
+import Distribution.Utils.NubList      ( toNubList )
 import Distribution.Simple.Compiler    ( Compiler, PackageDB(..)
                                        , compilerFlavor, showCompilerIdWithAbi )
 import Distribution.Simple.InstallDirs ( InstallDirs(..), PathTemplate
@@ -50,7 +50,8 @@ import Distribution.Simple.InstallDirs ( InstallDirs(..), PathTemplate
 import Distribution.Simple.Setup       ( Flag(..)
                                        , ConfigFlags(..), HaddockFlags(..)
                                        , fromFlagOrDefault, toFlag, flagToMaybe )
-import Distribution.Simple.Utils       ( die, info, notice, warn )
+import Distribution.Simple.Utils       ( die', info, notice, warn, debug )
+import Distribution.Solver.Types.ConstraintSource
 import Distribution.ParseUtils         ( FieldDescr(..), ParseResult(..)
                                        , commaListField, commaNewLineListField
                                        , liftField, lineNo, locatedErrorMsg
@@ -59,13 +60,12 @@ import Distribution.ParseUtils         ( FieldDescr(..), ParseResult(..)
                                        , syntaxError, warning )
 import Distribution.System             ( Platform )
 import Distribution.Verbosity          ( Verbosity, normal )
-import Control.Monad                   ( foldM, liftM2, when, unless )
-import Data.List                       ( partition )
+import Control.Monad                   ( foldM, liftM2, unless )
+import Data.List                       ( partition, sortBy )
 import Data.Maybe                      ( isJust )
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid                     ( Monoid(..) )
-#endif
+import Data.Ord                        ( comparing )
 import Distribution.Compat.Exception   ( catchIO )
+import Distribution.Compat.Semigroup
 import System.Directory                ( doesDirectoryExist, doesFileExist
                                        , renameFile )
 import System.FilePath                 ( (<.>), (</>), takeDirectory )
@@ -76,6 +76,7 @@ import qualified Text.PrettyPrint          as Disp
 import qualified Distribution.Compat.ReadP as Parse
 import qualified Distribution.ParseUtils   as ParseUtils ( Field(..) )
 import qualified Distribution.Text         as Text
+import GHC.Generics ( Generic )
 
 
 --
@@ -89,20 +90,14 @@ data PackageEnvironment = PackageEnvironment {
   -- for constructing nested sandboxes (see discussion in #1196).
   pkgEnvInherit       :: Flag FilePath,
   pkgEnvSavedConfig   :: SavedConfig
-}
+} deriving Generic
 
 instance Monoid PackageEnvironment where
-  mempty = PackageEnvironment {
-    pkgEnvInherit       = mempty,
-    pkgEnvSavedConfig   = mempty
-    }
+  mempty = gmempty
+  mappend = (<>)
 
-  mappend a b = PackageEnvironment {
-    pkgEnvInherit       = combine pkgEnvInherit,
-    pkgEnvSavedConfig   = combine pkgEnvSavedConfig
-    }
-    where
-      combine f = f a `mappend` f b
+instance Semigroup PackageEnvironment where
+  (<>) = gmappend
 
 -- | The automatically-created package environment file that should not be
 -- touched by the user.
@@ -281,27 +276,41 @@ inheritedPackageEnvironment verbosity pkgEnv = do
       return $ mempty { pkgEnvSavedConfig = conf }
 
 -- | Load the user package environment if it exists (the optional "cabal.config"
--- file).
-userPackageEnvironment :: Verbosity -> FilePath -> IO PackageEnvironment
-userPackageEnvironment verbosity pkgEnvDir = do
-  let path = pkgEnvDir </> userPackageEnvironmentFile
-  minp <- readPackageEnvironmentFile ConstraintSourceUserConfig mempty path
-  case minp of
-    Nothing -> return mempty
-    Just (ParseOk warns parseResult) -> do
-      when (not $ null warns) $ warn verbosity $
+-- file). If it does not exist locally, attempt to load an optional global one.
+userPackageEnvironment :: Verbosity -> FilePath -> Maybe FilePath
+                       -> IO PackageEnvironment
+userPackageEnvironment verbosity pkgEnvDir globalConfigLocation = do
+    let path = pkgEnvDir </> userPackageEnvironmentFile
+    minp <- readPackageEnvironmentFile (ConstraintSourceUserConfig path)
+            mempty path
+    case (minp, globalConfigLocation) of
+      (Just parseRes, _)  -> processConfigParse path parseRes
+      (_, Just globalLoc) -> do
+        minp' <- readPackageEnvironmentFile (ConstraintSourceUserConfig globalLoc)
+                 mempty globalLoc
+        maybe (warn verbosity ("no constraints file found at " ++ globalLoc)
+               >> return mempty)
+          (processConfigParse globalLoc)
+          minp'
+      _ -> do
+        debug verbosity ("no user package environment file found at " ++ pkgEnvDir)
+        return mempty
+  where
+    processConfigParse path (ParseOk warns parseResult) = do
+      unless (null warns) $ warn verbosity $
         unlines (map (showPWarning path) warns)
       return parseResult
-    Just (ParseFailed err) -> do
+    processConfigParse path (ParseFailed err) = do
       let (line, msg) = locatedErrorMsg err
-      warn verbosity $ "Error parsing user package environment file " ++ path
+      warn verbosity $ "Error parsing package environment file " ++ path
         ++ maybe "" (\n -> ":" ++ show n) line ++ ":\n" ++ msg
       return mempty
 
 -- | Same as @userPackageEnvironmentFile@, but returns a SavedConfig.
-loadUserConfig :: Verbosity -> FilePath -> IO SavedConfig
-loadUserConfig verbosity pkgEnvDir = fmap pkgEnvSavedConfig
-                                     $ userPackageEnvironment verbosity pkgEnvDir
+loadUserConfig :: Verbosity -> FilePath -> Maybe FilePath -> IO SavedConfig
+loadUserConfig verbosity pkgEnvDir globalConfigLocation =
+    fmap pkgEnvSavedConfig $
+    userPackageEnvironment verbosity pkgEnvDir globalConfigLocation
 
 -- | Common error handling code used by 'tryLoadSandboxPackageEnvironment' and
 -- 'updatePackageEnvironment'.
@@ -310,15 +319,15 @@ handleParseResult :: Verbosity -> FilePath
                      -> IO PackageEnvironment
 handleParseResult verbosity path minp =
   case minp of
-    Nothing -> die $
+    Nothing -> die' verbosity $
       "The package environment file '" ++ path ++ "' doesn't exist"
     Just (ParseOk warns parseResult) -> do
-      when (not $ null warns) $ warn verbosity $
+      unless (null warns) $ warn verbosity $
         unlines (map (showPWarning path) warns)
       return parseResult
     Just (ParseFailed err) -> do
       let (line, msg) = locatedErrorMsg err
-      die $ "Error parsing package environment file " ++ path
+      die' verbosity $ "Error parsing package environment file " ++ path
         ++ maybe "" (\n -> ":" ++ show n) line ++ ":\n" ++ msg
 
 -- | Try to load the given package environment file, exiting with error if it
@@ -343,12 +352,12 @@ tryLoadSandboxPackageEnvironmentFile verbosity pkgEnvFile configFileFlag = do
   dirExists            <- doesDirectoryExist sandboxDir
   -- TODO: Also check for an initialised package DB?
   unless dirExists $
-    die ("No sandbox exists at " ++ sandboxDir)
+    die' verbosity ("No sandbox exists at " ++ sandboxDir)
   info verbosity $ "Using a sandbox located at " ++ sandboxDir
 
   let base   = basePackageEnvironment
   let common = commonPackageEnvironment sandboxDir
-  user      <- userPackageEnvironment verbosity pkgEnvDir
+  user      <- userPackageEnvironment verbosity pkgEnvDir Nothing --TODO
   inherited <- inheritedPackageEnvironment verbosity user
 
   -- Layer the package environment settings over settings from ~/.cabal/config.
@@ -383,24 +392,16 @@ tryLoadSandboxPackageEnvironmentFile verbosity pkgEnvFile configFileFlag = do
              }
           }
 
--- | Should the generated package environment file include comments?
-data IncludeComments = IncludeComments | NoComments
-
 -- | Create a new package environment file, replacing the existing one if it
 -- exists. Note that the path parameters should point to existing directories.
 createPackageEnvironmentFile :: Verbosity -> FilePath -> FilePath
-                                -> IncludeComments
                                 -> Compiler
                                 -> Platform
                                 -> IO ()
-createPackageEnvironmentFile verbosity sandboxDir pkgEnvFile incComments
-  compiler platform = do
-  notice verbosity $ "Writing a default package environment file to "
-    ++ pkgEnvFile
-
-  commentPkgEnv <- commentPackageEnvironment sandboxDir
+createPackageEnvironmentFile verbosity sandboxDir pkgEnvFile compiler platform = do
+  notice verbosity $ "Writing a default package environment file to " ++ pkgEnvFile
   initialPkgEnv <- initialPackageEnvironment sandboxDir compiler platform
-  writePackageEnvironmentFile pkgEnvFile incComments commentPkgEnv initialPkgEnv
+  writePackageEnvironmentFile pkgEnvFile initialPkgEnv
 
 -- | Descriptions of all fields in the package environment file.
 pkgEnvFieldDescrs :: ConstraintSource -> [FieldDescr PackageEnvironment]
@@ -409,10 +410,10 @@ pkgEnvFieldDescrs src = [
     (fromFlagOrDefault Disp.empty . fmap Disp.text) (optional parseFilePathQ)
     pkgEnvInherit (\v pkgEnv -> pkgEnv { pkgEnvInherit = v })
 
-    -- FIXME: Should we make these fields part of ~/.cabal/config ?
   , commaNewLineListField "constraints"
     (Text.disp . fst) ((\pc -> (pc, src)) `fmap` Text.parse)
-    (configExConstraints . savedConfigureExFlags . pkgEnvSavedConfig)
+    (sortConstraints . configExConstraints
+     . savedConfigureExFlags . pkgEnvSavedConfig)
     (\v pkgEnv -> updateConfigureExFlags pkgEnv
                   (\flags -> flags { configExConstraints = v }))
 
@@ -446,6 +447,8 @@ pkgEnvFieldDescrs src = [
                                  $ pkgEnv
          }
       }
+
+    sortConstraints = sortBy (comparing $ userConstraintPackageName . fst)
 
 -- | Read the package environment file.
 readPackageEnvironmentFile :: ConstraintSource -> PackageEnvironment -> FilePath
@@ -536,18 +539,13 @@ type SectionsAccum = (HaddockFlags, InstallDirs (Flag PathTemplate)
                      , [(String, FilePath)], [(String, [String])])
 
 -- | Write out the package environment file.
-writePackageEnvironmentFile :: FilePath -> IncludeComments
-                               -> PackageEnvironment -> PackageEnvironment
-                               -> IO ()
-writePackageEnvironmentFile path incComments comments pkgEnv = do
+writePackageEnvironmentFile :: FilePath -> PackageEnvironment -> IO ()
+writePackageEnvironmentFile path pkgEnv = do
   let tmpPath = (path <.> "tmp")
   writeFile tmpPath $ explanation ++ pkgEnvStr ++ "\n"
   renameFile tmpPath path
   where
-    pkgEnvStr = case incComments of
-      IncludeComments -> showPackageEnvironmentWithComments
-                         (Just comments) pkgEnv
-      NoComments      -> showPackageEnvironment pkgEnv
+    pkgEnvStr = showPackageEnvironment pkgEnv
     explanation = unlines
       ["-- This is a Cabal package environment file."
       ,"-- THIS FILE IS AUTO-GENERATED. DO NOT EDIT DIRECTLY."

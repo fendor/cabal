@@ -17,7 +17,7 @@ module Distribution.Client.Win32SelfUpgrade (
 -- | Windows inherited a design choice from DOS that while initially innocuous
 -- has rather unfortunate consequences. It maintains the invariant that every
 -- open file has a corresponding name on disk. One positive consequence of this
--- is that an executable can always find it's own executable file. The downside
+-- is that an executable can always find its own executable file. The downside
 -- is that a program cannot be deleted or upgraded while it is running without
 -- hideous workarounds. This module implements one such hideous workaround.
 --
@@ -42,7 +42,7 @@ module Distribution.Client.Win32SelfUpgrade (
     deleteOldExeFile,
   ) where
 
-#if mingw32_HOST_OS
+#ifdef mingw32_HOST_OS
 
 import qualified System.Win32 as Win32
 import System.Win32 (DWORD, BOOL, HANDLE, LPCTSTR)
@@ -212,7 +212,7 @@ setEvent handle =
 #else
 
 import Distribution.Verbosity (Verbosity)
-import Distribution.Simple.Utils (die)
+import Distribution.Simple.Utils (die')
 
 possibleSelfUpgrade :: Verbosity
                     -> [FilePath]
@@ -220,6 +220,6 @@ possibleSelfUpgrade :: Verbosity
 possibleSelfUpgrade _ _ action = action
 
 deleteOldExeFile :: Verbosity -> Int -> FilePath -> IO ()
-deleteOldExeFile _ _ _ = die "win32selfupgrade not needed except on win32"
+deleteOldExeFile verbosity _ _ = die' verbosity "win32selfupgrade not needed except on win32"
 
 #endif

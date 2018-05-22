@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -10,7 +11,7 @@
 -- Portability :  portable
 --
 -- This should be a much more sophisticated abstraction than it is. Currently
--- it's just a bit of data about the compiler, like it's flavour and name and
+-- it's just a bit of data about the compiler, like its flavour and name and
 -- version. The reason it's just data is because currently it has to be in
 -- 'Read' and 'Show' so it can be saved along with the 'LocalBuildInfo'. The
 -- only interesting bit of info it contains is a mapping between language
@@ -26,6 +27,7 @@ module Distribution.Simple.Compiler (
         Compiler(..),
         showCompilerId, showCompilerIdWithAbi,
         compilerFlavor, compilerVersion,
+        compilerCompatFlavor,
         compilerCompatVersion,
         compilerInfo,
 
@@ -53,43 +55,52 @@ module Distribution.Simple.Compiler (
         parmakeSupported,
         reexportedModulesSupported,
         renamingPackageFlagsSupported,
+        unifiedIPIDRequired,
         packageKeySupported,
+        unitIdSupported,
+        coverageSupported,
+        profilingSupported,
+        backpackSupported,
+        arResponseFilesSupported,
+        libraryDynDirSupported,
 
         -- * Support for profiling detail levels
         ProfDetailLevel(..),
         knownProfDetailLevels,
         flagToProfDetailLevel,
+        showProfDetailLevel,
   ) where
 
-import Distribution.Compiler
-import Distribution.Version (Version(..))
-import Distribution.Text (display)
-import Language.Haskell.Extension (Language(Haskell98), Extension)
-import Distribution.Simple.Utils (lowercase)
+import Prelude ()
+import Distribution.Compat.Prelude
 
-import Control.Monad (liftM)
-import Distribution.Compat.Binary (Binary)
-import Data.List (nub)
-import qualified Data.Map as M (Map, lookup)
-import Data.Maybe (catMaybes, isNothing, listToMaybe)
-import GHC.Generics (Generic)
+import Distribution.Compiler
+import Distribution.Version
+import Distribution.Text
+import Language.Haskell.Extension
+import Distribution.Simple.Utils
+
+import Control.Monad (join)
+import qualified Data.Map as Map (lookup)
 import System.Directory (canonicalizePath)
 
 data Compiler = Compiler {
         compilerId              :: CompilerId,
         -- ^ Compiler flavour and version.
         compilerAbiTag          :: AbiTag,
-        -- ^ Tag for distinguishing incompatible ABI's on the same architecture/os.
+        -- ^ Tag for distinguishing incompatible ABI's on the same
+        -- architecture/os.
         compilerCompat          :: [CompilerId],
-        -- ^ Other implementations that this compiler claims to be compatible with.
+        -- ^ Other implementations that this compiler claims to be
+        -- compatible with.
         compilerLanguages       :: [(Language, Flag)],
         -- ^ Supported language standards.
-        compilerExtensions      :: [(Extension, Flag)],
+        compilerExtensions      :: [(Extension, Maybe Flag)],
         -- ^ Supported extensions.
-        compilerProperties      :: M.Map String String
+        compilerProperties      :: Map String String
         -- ^ A key-value map for properties not covered by the above fields.
     }
-    deriving (Generic, Show, Read)
+    deriving (Eq, Generic, Typeable, Show, Read)
 
 instance Binary Compiler
 
@@ -109,6 +120,30 @@ compilerFlavor = (\(CompilerId f _) -> f) . compilerId
 compilerVersion :: Compiler -> Version
 compilerVersion = (\(CompilerId _ v) -> v) . compilerId
 
+
+-- | Is this compiler compatible with the compiler flavour we're interested in?
+--
+-- For example this checks if the compiler is actually GHC or is another
+-- compiler that claims to be compatible with some version of GHC, e.g. GHCJS.
+--
+-- > if compilerCompatFlavor GHC compiler then ... else ...
+--
+compilerCompatFlavor :: CompilerFlavor -> Compiler -> Bool
+compilerCompatFlavor flavor comp =
+    flavor == compilerFlavor comp
+ || flavor `elem` [ flavor' | CompilerId flavor' _ <- compilerCompat comp ]
+
+
+-- | Is this compiler compatible with the compiler flavour we're interested in,
+-- and if so what version does it claim to be compatible with.
+--
+-- For example this checks if the compiler is actually GHC-7.x or is another
+-- compiler that claims to be compatible with some GHC-7.x version.
+--
+-- > case compilerCompatVersion GHC compiler of
+-- >   Just (Version (7:_)) -> ...
+-- >   _                    -> ...
+--
 compilerCompatVersion :: CompilerFlavor -> Compiler -> Maybe Version
 compilerCompatVersion flavor comp
   | compilerFlavor comp == flavor = Just (compilerVersion comp)
@@ -168,10 +203,10 @@ registrationPackageDB dbs = last dbs
 -- | Make package paths absolute
 
 
-absolutePackageDBPaths :: PackageDBStack -> IO PackageDBStack
-absolutePackageDBPaths = mapM absolutePackageDBPath
+absolutePackageDBPaths :: PackageDBStack -> NoCallStackIO PackageDBStack
+absolutePackageDBPaths = traverse absolutePackageDBPath
 
-absolutePackageDBPath :: PackageDB -> IO PackageDB
+absolutePackageDBPath :: PackageDB -> NoCallStackIO PackageDB
 absolutePackageDBPath GlobalPackageDB        = return GlobalPackageDB
 absolutePackageDBPath UserPackageDB          = return UserPackageDB
 absolutePackageDBPath (SpecificPackageDB db) =
@@ -252,7 +287,7 @@ languageToFlag comp ext = lookup ext (compilerLanguages comp)
 unsupportedExtensions :: Compiler -> [Extension] -> [Extension]
 unsupportedExtensions comp exts =
   [ ext | ext <- exts
-        , isNothing (extensionToFlag comp ext) ]
+        , isNothing (extensionToFlag' comp ext) ]
 
 type Flag = String
 
@@ -261,8 +296,22 @@ extensionsToFlags :: Compiler -> [Extension] -> [Flag]
 extensionsToFlags comp = nub . filter (not . null)
                        . catMaybes . map (extensionToFlag comp)
 
+-- | Looks up the flag for a given extension, for a given compiler.
+-- Ignores the subtlety of extensions which lack associated flags.
 extensionToFlag :: Compiler -> Extension -> Maybe Flag
-extensionToFlag comp ext = lookup ext (compilerExtensions comp)
+extensionToFlag comp ext = join (extensionToFlag' comp ext)
+
+-- | Looks up the flag for a given extension, for a given compiler.
+-- However, the extension may be valid for the compiler but not have a flag.
+-- For example, NondecreasingIndentation is enabled by default on GHC 7.0.4,
+-- hence it is considered a supported extension but not an accepted flag.
+--
+-- The outer layer of Maybe indicates whether the extensions is supported, while
+-- the inner layer indicates whether it has a flag.
+-- When building strings, it is often more convenient to use 'extensionToFlag',
+-- which ignores the difference.
+extensionToFlag' :: Compiler -> Extension -> Maybe (Maybe Flag)
+extensionToFlag' comp ext = lookup ext (compilerExtensions comp)
 
 -- | Does this compiler support parallel --make mode?
 parmakeSupported :: Compiler -> Bool
@@ -274,11 +323,59 @@ reexportedModulesSupported = ghcSupported "Support reexported-modules"
 
 -- | Does this compiler support thinning/renaming on package flags?
 renamingPackageFlagsSupported :: Compiler -> Bool
-renamingPackageFlagsSupported = ghcSupported "Support thinning and renaming package flags"
+renamingPackageFlagsSupported = ghcSupported
+  "Support thinning and renaming package flags"
+
+-- | Does this compiler have unified IPIDs (so no package keys)
+unifiedIPIDRequired :: Compiler -> Bool
+unifiedIPIDRequired = ghcSupported "Requires unified installed package IDs"
 
 -- | Does this compiler support package keys?
 packageKeySupported :: Compiler -> Bool
 packageKeySupported = ghcSupported "Uses package keys"
+
+-- | Does this compiler support unit IDs?
+unitIdSupported :: Compiler -> Bool
+unitIdSupported = ghcSupported "Uses unit IDs"
+
+-- | Does this compiler support Backpack?
+backpackSupported :: Compiler -> Bool
+backpackSupported = ghcSupported "Support Backpack"
+
+-- | Does this compiler support a package database entry with:
+-- "dynamic-library-dirs"?
+libraryDynDirSupported :: Compiler -> Bool
+libraryDynDirSupported comp = case compilerFlavor comp of
+  GHC ->
+      -- Not just v >= mkVersion [8,0,1,20161022], as there
+      -- are many GHC 8.1 nightlies which don't support this.
+    ((v >= mkVersion [8,0,1,20161022] && v < mkVersion [8,1]) ||
+      v >= mkVersion [8,1,20161021])
+  _   -> False
+ where
+  v = compilerVersion comp
+
+-- | Does this compiler's "ar" command supports response file
+-- arguments (i.e. @file-style arguments).
+arResponseFilesSupported :: Compiler -> Bool
+arResponseFilesSupported = ghcSupported "ar supports at file"
+
+-- | Does this compiler support Haskell program coverage?
+coverageSupported :: Compiler -> Bool
+coverageSupported comp =
+  case compilerFlavor comp of
+    GHC   -> True
+    GHCJS -> True
+    _     -> False
+
+-- | Does this compiler support profiling?
+profilingSupported :: Compiler -> Bool
+profilingSupported comp =
+  case compilerFlavor comp of
+    GHC   -> True
+    GHCJS -> True
+    LHC   -> True
+    _     -> False
 
 -- | Utility function for GHC only features
 ghcSupported :: String -> Compiler -> Bool
@@ -288,7 +385,7 @@ ghcSupported key comp =
     GHCJS -> checkProp
     _     -> False
   where checkProp =
-          case M.lookup key (compilerProperties comp) of
+          case Map.lookup key (compilerProperties comp) of
             Just "YES" -> True
             _          -> False
 
@@ -331,4 +428,13 @@ knownProfDetailLevels =
   , ("toplevel-functions", ["toplevel", "top"], ProfDetailToplevelFunctions)
   , ("all-functions",      ["all"],             ProfDetailAllFunctions)
   ]
+
+showProfDetailLevel :: ProfDetailLevel -> String
+showProfDetailLevel dl = case dl of
+    ProfDetailNone              -> "none"
+    ProfDetailDefault           -> "default"
+    ProfDetailExportedFunctions -> "exported-functions"
+    ProfDetailToplevelFunctions -> "toplevel-functions"
+    ProfDetailAllFunctions      -> "all-functions"
+    ProfDetailOther other       -> other
 
