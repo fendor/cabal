@@ -80,6 +80,7 @@ import qualified Distribution.Client.List as List
 import qualified Distribution.Client.CmdConfigure as CmdConfigure
 import qualified Distribution.Client.CmdUpdate    as CmdUpdate
 import qualified Distribution.Client.CmdBuild     as CmdBuild
+import qualified Distribution.Client.CmdShowBuildInfo as CmdShowBuildInfo
 import qualified Distribution.Client.CmdRepl      as CmdRepl
 import qualified Distribution.Client.CmdFreeze    as CmdFreeze
 import qualified Distribution.Client.CmdHaddock   as CmdHaddock
@@ -318,6 +319,8 @@ mainWorker args = topHandler $
       , regularCmd  CmdConfigure.configureCommand CmdConfigure.configureAction
       , regularCmd  CmdUpdate.updateCommand       CmdUpdate.updateAction
       , regularCmd  CmdBuild.buildCommand         CmdBuild.buildAction
+      , regularCmd  CmdShowBuildInfo.showBuildInfoCommand
+                      CmdShowBuildInfo.showBuildInfoAction
       , regularCmd  CmdRepl.replCommand           CmdRepl.replAction
       , regularCmd  CmdFreeze.freezeCommand       CmdFreeze.freezeAction
       , regularCmd  CmdHaddock.haddockCommand     CmdHaddock.haddockAction

@@ -151,6 +151,7 @@ library
         Distribution.Client.Check
         Distribution.Client.CmdBench
         Distribution.Client.CmdBuild
+        Distribution.Client.CmdShowBuildInfo
         Distribution.Client.CmdConfigure
         Distribution.Client.CmdUpdate
         Distribution.Client.CmdErrorMessages
