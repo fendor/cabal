@@ -48,6 +48,7 @@ import Distribution.Client.Setup
          , UserConfigFlags(..), userConfigCommand
          , reportCommand
          , manpageCommand
+         , WriteAutogenFilesFlags(..), writeAutogenFilesCommand
          )
 import Distribution.Simple.Setup
          ( HaddockTarget(..)
@@ -80,6 +81,8 @@ import qualified Distribution.Client.List as List
 import qualified Distribution.Client.CmdConfigure as CmdConfigure
 import qualified Distribution.Client.CmdUpdate    as CmdUpdate
 import qualified Distribution.Client.CmdBuild     as CmdBuild
+import qualified Distribution.Client.CmdShowBuildInfo as CmdShowBuildInfo
+import qualified Distribution.Client.CmdWriteAutogenFiles as CmdWriteAutogenFiles
 import qualified Distribution.Client.CmdRepl      as CmdRepl
 import qualified Distribution.Client.CmdFreeze    as CmdFreeze
 import qualified Distribution.Client.CmdHaddock   as CmdHaddock
@@ -151,7 +154,7 @@ import qualified Distribution.Simple as Simple
 import qualified Distribution.Make as Make
 import qualified Distribution.Types.UnqualComponentName as Make
 import Distribution.Simple.Build
-         ( startInterpreter )
+         ( startInterpreter, initialBuildSteps )
 import Distribution.Simple.Command
          ( CommandParse(..), CommandUI(..), Command, CommandSpec(..)
          , CommandType(..), commandsRun, commandAddAction, hiddenCommand
@@ -174,7 +177,7 @@ import Distribution.Simple.Utils
 import Distribution.Text
          ( display )
 import Distribution.Verbosity as Verbosity
-         ( Verbosity, normal )
+         ( Verbosity, normal, silent )
 import Distribution.Version
          ( Version, mkVersion, orLaterVersion )
 import qualified Paths_cabal_install (version)
@@ -293,7 +296,6 @@ mainWorker args = topHandler $
       , regularCmd configureExCommand configureAction
       , regularCmd reconfigureCommand reconfigureAction
       , regularCmd buildCommand buildAction
-      , regularCmd showBuildInfoCommand showBuildInfoAction
       , regularCmd replCommand replAction
       , regularCmd sandboxCommand sandboxAction
       , regularCmd doctestCommand doctestAction
@@ -326,6 +328,14 @@ mainWorker args = topHandler $
       , regularCmd  CmdTest.testCommand           CmdTest.testAction
       , regularCmd  CmdBench.benchCommand         CmdBench.benchAction
       , regularCmd  CmdExec.execCommand           CmdExec.execAction
+
+      -- ghc-mod supporting commands
+      , hiddenCmd showBuildInfoCommand showBuildInfoAction
+      , hiddenCmd CmdShowBuildInfo.showBuildInfoCommand
+                    CmdShowBuildInfo.showBuildInfoAction
+      , hiddenCmd writeAutogenFilesCommand writeAutogenFilesAction
+      , hiddenCmd CmdWriteAutogenFiles.writeAutogenFilesCommand
+                    CmdWriteAutogenFiles.writeAutogenFilesAction
       ]
 
 type Action = GlobalFlags -> IO ()
@@ -435,18 +445,23 @@ reconfigureAction flags@(configFlags, _) _ globalFlags = do
 
 
 buildAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-buildAction = buildActionForCommand (Cabal.buildCommand defaultProgramDb)
+buildAction flags@(buildFlags, _) = 
+  buildActionForCommand (Cabal.buildCommand defaultProgramDb) verbosity flags
+    where verbosity = fromFlagOrDefault normal (buildVerbosity buildFlags)
 
 showBuildInfoAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-showBuildInfoAction = buildActionForCommand (Cabal.showBuildInfoCommand defaultProgramDb)
+showBuildInfoAction flags@(buildFlags, _) =
+    buildActionForCommand (Cabal.showBuildInfoCommand defaultProgramDb) verbosity flags
+      -- Default silent verbosity so as not to pollute json output
+      where verbosity = fromFlagOrDefault silent (buildVerbosity buildFlags)
 
 buildActionForCommand :: CommandUI BuildFlags
+                      -> Verbosity
                       -> (BuildFlags, BuildExFlags)
                       -> [String]
                       -> Action
-buildActionForCommand commandUI (buildFlags, buildExFlags) extraArgs globalFlags = do
-  let verbosity = fromFlagOrDefault normal (buildVerbosity buildFlags)
-      noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
+buildActionForCommand commandUI verbosity (buildFlags, buildExFlags) extraArgs globalFlags = do
+  let  noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
                     (buildOnly buildExFlags)
   (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
   distPref <- findSavedDistPref config (buildDistPref buildFlags)
@@ -1245,3 +1260,23 @@ manpageAction commands flagVerbosity extraArgs _ = do
                  then dropExtension pname
                  else pname
   putStrLn $ manpage cabalCmd commands
+
+--Further commands to support ghc-mod usage
+writeAutogenFilesAction :: WriteAutogenFilesFlags -> [String] -> Action
+writeAutogenFilesAction flags _ globalFlags = do
+  let verbosity = fromFlag (wafVerbosity flags)
+  load <- try (loadConfigOrSandboxConfig verbosity globalFlags)
+  let config = either (\(SomeException _) -> mempty) snd load
+  distPref <- findSavedDistPref config (wafDistPref flags)
+  pkg <- fmap LBI.localPkgDescr (getPersistBuildConfig distPref)
+  eLBI <- tryGetPersistBuildConfig distPref
+  case eLBI of
+    Left err -> case err of
+      -- Note: the build config could have been generated by a custom setup
+      -- script built against a different Cabal version, so it's crucial that
+      -- we ignore the bad version error here.
+      ConfigStateFileBadVersion _ _ _ -> pure ()
+      _                               -> die' verbosity (show err)
+    Right lbi -> do
+      initialBuildSteps distPref pkg lbi verbosity
+      pure ()
