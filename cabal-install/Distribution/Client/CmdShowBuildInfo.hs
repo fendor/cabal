@@ -120,8 +120,7 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
     -- rpkg@(ReadyPackage pkg)
     -- let dsc = elabPkgDescription pkg
     -- print $ pkg buildCtx
-    mapM print (InstallPlan.toList (elaboratedPlanToExecute buildCtx))
-    let pkg = (first . pkgList) buildCtx
+    let pkg = (last . pkgList) buildCtx
         shared = elaboratedShared buildCtx
         builddir = distBuildDirectory (distDirLayout baseCtx) (elabDistDirParams shared pkg)
         flags = setupHsBuildFlags pkg shared verbosity builddir
@@ -132,7 +131,7 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
                   installFlags haddockFlags
-    pkgList ctx = [s | InstallPlan.Installed s <- InstallPlan.toList (elaboratedPlanToExecute ctx)]
+    pkgList ctx = [s | InstallPlan.Installed s <- InstallPlan.toList (elaboratedPlanOriginal ctx)]
 
 -- | This defines what a 'TargetSelector' means for the @bench@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
