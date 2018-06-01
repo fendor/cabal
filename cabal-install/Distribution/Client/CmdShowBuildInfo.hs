@@ -16,7 +16,7 @@ import Distribution.Simple.Setup
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( Verbosity, silent )
 import Distribution.Simple.Utils
          ( wrapText)
 
@@ -95,7 +95,8 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
   mapM_ (showInfo verbosity baseCtx' buildCtx scriptLock (configured buildCtx)) targetStrings
   
   where
-    verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
+    -- Default to silent verbosity otherwise it will pollute our json output
+    verbosity = fromFlagOrDefault silent (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
                   installFlags haddockFlags

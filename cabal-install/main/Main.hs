@@ -175,7 +175,7 @@ import Distribution.Simple.Utils
 import Distribution.Text
          ( display )
 import Distribution.Verbosity as Verbosity
-         ( Verbosity, normal )
+         ( Verbosity, normal, silent )
 import Distribution.Version
          ( Version, mkVersion, orLaterVersion )
 import qualified Paths_cabal_install (version)
@@ -438,18 +438,23 @@ reconfigureAction flags@(configFlags, _) _ globalFlags = do
 
 
 buildAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-buildAction = buildActionForCommand (Cabal.buildCommand defaultProgramDb)
+buildAction flags@(buildFlags, _) = 
+  buildActionForCommand (Cabal.buildCommand defaultProgramDb) verbosity flags
+    where verbosity = fromFlagOrDefault normal (buildVerbosity buildFlags)
 
 showBuildInfoAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-showBuildInfoAction = buildActionForCommand (Cabal.showBuildInfoCommand defaultProgramDb)
+showBuildInfoAction flags@(buildFlags, _) =
+    buildActionForCommand (Cabal.showBuildInfoCommand defaultProgramDb) verbosity flags
+      -- Default silent verbosity so as not to pollute json output
+      where verbosity = fromFlagOrDefault silent (buildVerbosity buildFlags)
 
 buildActionForCommand :: CommandUI BuildFlags
+                      -> Verbosity
                       -> (BuildFlags, BuildExFlags)
                       -> [String]
                       -> Action
-buildActionForCommand commandUI (buildFlags, buildExFlags) extraArgs globalFlags = do
-  let verbosity = fromFlagOrDefault normal (buildVerbosity buildFlags)
-      noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
+buildActionForCommand commandUI verbosity (buildFlags, buildExFlags) extraArgs globalFlags = do
+  let  noAddSource = fromFlagOrDefault DontSkipAddSourceDepsCheck
                     (buildOnly buildExFlags)
   (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
   distPref <- findSavedDistPref config (buildDistPref buildFlags)
