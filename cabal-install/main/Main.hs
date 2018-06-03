@@ -294,7 +294,6 @@ mainWorker args = topHandler $
       , regularCmd configureExCommand configureAction
       , regularCmd reconfigureCommand reconfigureAction
       , regularCmd buildCommand buildAction
-      , regularCmd showBuildInfoCommand showBuildInfoAction
       , regularCmd replCommand replAction
       , regularCmd sandboxCommand sandboxAction
       , regularCmd doctestCommand doctestAction
@@ -319,8 +318,6 @@ mainWorker args = topHandler $
       , regularCmd  CmdConfigure.configureCommand CmdConfigure.configureAction
       , regularCmd  CmdUpdate.updateCommand       CmdUpdate.updateAction
       , regularCmd  CmdBuild.buildCommand         CmdBuild.buildAction
-      , regularCmd  CmdShowBuildInfo.showBuildInfoCommand
-                      CmdShowBuildInfo.showBuildInfoAction
       , regularCmd  CmdRepl.replCommand           CmdRepl.replAction
       , regularCmd  CmdFreeze.freezeCommand       CmdFreeze.freezeAction
       , regularCmd  CmdHaddock.haddockCommand     CmdHaddock.haddockAction
@@ -329,6 +326,11 @@ mainWorker args = topHandler $
       , regularCmd  CmdTest.testCommand           CmdTest.testAction
       , regularCmd  CmdBench.benchCommand         CmdBench.benchAction
       , regularCmd  CmdExec.execCommand           CmdExec.execAction
+
+      -- ghc-mod supporting commands
+      , hiddenCmd showBuildInfoCommand showBuildInfoAction
+      , hiddenCmd  CmdShowBuildInfo.showBuildInfoCommand
+                      CmdShowBuildInfo.showBuildInfoAction
       ]
 
 type Action = GlobalFlags -> IO ()
