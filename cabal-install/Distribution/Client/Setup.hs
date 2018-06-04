@@ -21,7 +21,7 @@ module Distribution.Client.Setup
     , configPackageDB', configCompilerAux'
     , configureExCommand, ConfigExFlags(..), defaultConfigExFlags
     , buildCommand, BuildFlags(..), BuildExFlags(..), SkipAddSourceDepsCheck(..)
-    , showBuildInfoCommand, replCommand, testCommand, benchmarkCommand
+    , replCommand, testCommand, benchmarkCommand
                         , configureExOptions, reconfigureCommand
     , installCommand, InstallFlags(..), installOptions, defaultInstallFlags
     , defaultSolver, defaultMaxBackjumps
@@ -49,6 +49,9 @@ module Distribution.Client.Setup
     , userConfigCommand, UserConfigFlags(..)
     , manpageCommand
 
+    --ghc-mod support commands
+    , showBuildInfoCommand
+    , writeAutogenFilesCommand
     , parsePackageArgs
     --TODO: stop exporting these:
     , showRepo
@@ -179,6 +182,7 @@ globalCommand commands = CommandUI {
           , "hscolour"
           , "copy"
           , "show-build-info"
+          , "write-autogen-files"
           , "register"
           , "sandbox"
           , "exec"
@@ -234,6 +238,7 @@ globalCommand commands = CommandUI {
         , addCmd "report"
         , par
         , addCmd "show-build-info"
+        , addCmd "write-autogen-files"
         , addCmd "freeze"
         , addCmd "gen-bounds"
         , addCmd "outdated"
@@ -671,25 +676,6 @@ instance Monoid BuildExFlags where
 
 instance Semigroup BuildExFlags where
   (<>) = gmappend
-
--- ------------------------------------------------------------
--- * show-build-info command
--- ------------------------------------------------------------
-
-showBuildInfoCommand :: CommandUI (BuildFlags, BuildExFlags)
-showBuildInfoCommand = parent {
-    commandDefaultFlags = (commandDefaultFlags parent, mempty),
-    commandOptions      =
-      \showOrParseArgs -> liftOptions fst setFst
-                          (commandOptions parent showOrParseArgs)
-                          ++
-                          liftOptions snd setSnd (buildExOptions showOrParseArgs)
-  }
-  where
-    setFst a (_,b) = (a,b)
-    setSnd b (a,_) = (a,b)
-
-    parent = Cabal.showBuildInfoCommand defaultProgramDb
 
 -- ------------------------------------------------------------
 -- * Repl command
@@ -2642,3 +2628,26 @@ relevantConfigValuesText :: [String] -> String
 relevantConfigValuesText vs =
      "Relevant global configuration keys:\n"
   ++ concat ["  " ++ v ++ "\n" |v <- vs]
+
+
+-- ------------------------------------------------------------
+-- * Commands to support ghc-mod
+-- ------------------------------------------------------------
+
+showBuildInfoCommand :: CommandUI (BuildFlags, BuildExFlags)
+showBuildInfoCommand = parent {
+    commandDefaultFlags = (commandDefaultFlags parent, mempty),
+    commandOptions      =
+      \showOrParseArgs -> liftOptions fst setFst
+                          (commandOptions parent showOrParseArgs)
+                          ++
+                          liftOptions snd setSnd (buildExOptions showOrParseArgs)
+  }
+  where
+    setFst a (_,b) = (a,b)
+    setSnd b (a,_) = (a,b)
+
+    parent = Cabal.showBuildInfoCommand defaultProgramDb
+
+writeAutogenFilesCommand :: CommandUI (Flag Verbosity)
+writeAutogenFilesCommand = Cabal.writeAutogenFilesCommand defaultProgramDb
