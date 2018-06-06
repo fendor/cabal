@@ -51,7 +51,7 @@ module Distribution.Client.Setup
 
     --ghc-mod support commands
     , showBuildInfoCommand
-    , writeAutogenFilesCommand
+    , writeAutogenFilesCommand, WriteAutogenFilesFlags(..)
     , parsePackageArgs
     --TODO: stop exporting these:
     , showRepo
@@ -93,6 +93,7 @@ import Distribution.Simple.Setup
          ( ConfigFlags(..), BuildFlags(..), ReplFlags
          , TestFlags(..), BenchmarkFlags(..)
          , SDistFlags(..), HaddockFlags(..)
+         , WriteAutogenFilesFlags(..)
          , readPackageDbList, showPackageDbList
          , Flag(..), toFlag, flagToMaybe, flagToList, maybeToFlag
          , BooleanFlag(..), optionVerbosity
@@ -2649,5 +2650,5 @@ showBuildInfoCommand = parent {
 
     parent = Cabal.showBuildInfoCommand defaultProgramDb
 
-writeAutogenFilesCommand :: CommandUI (Flag Verbosity)
+writeAutogenFilesCommand :: CommandUI WriteAutogenFilesFlags
 writeAutogenFilesCommand = Cabal.writeAutogenFilesCommand defaultProgramDb

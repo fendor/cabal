@@ -48,6 +48,7 @@ module Distribution.Simple.Setup (
  
   showBuildInfoCommand,
   writeAutogenFilesCommand,
+  WriteAutogenFilesFlags(..),
   buildVerbose,
   ReplFlags(..),                         defaultReplFlags,     replCommand,
   CleanFlags(..),    emptyCleanFlags,    defaultCleanFlags,    cleanCommand,
@@ -2306,7 +2307,7 @@ showBuildInfoCommand progDb = CommandUI
       ++ buildOptions progDb showOrParseArgs
   }
 
-writeAutogenFilesCommand :: ProgramDb -> CommandUI (Flag Verbosity)
+writeAutogenFilesCommand :: ProgramDb -> CommandUI WriteAutogenFilesFlags
 writeAutogenFilesCommand progDb = CommandUI
   { commandName         = "write-autogen-files"
   , commandSynopsis     = "Generate and write out the Paths_<pkg>.hs and cabal_macros.h files"
@@ -2321,22 +2322,22 @@ writeAutogenFilesCommand progDb = CommandUI
         ++ "  " ++ pname ++ " write-autogen-files foo       "
         ++ "    A component (i.e. lib, exe, test suite)\n\n"
         ++ programFlagsDescription progDb
---TODO: re-enable once we have support for module/file targets
---        ++ "  " ++ pname ++ " show-build-info Foo.Bar   "
---        ++ "    A module\n"
---        ++ "  " ++ pname ++ " show-build-info Foo/Bar.hs"
---        ++ "    A file\n\n"
---        ++ "If a target is ambiguous it can be qualified with the component "
---        ++ "name, e.g.\n"
---        ++ "  " ++ pname ++ " show-build-info foo:Foo.Bar\n"
---        ++ "  " ++ pname ++ " show-build-info testsuite1:Foo/Bar.hs\n"
   , commandUsage        = usageAlternatives "write-autogen-files" $
-      [ "[FLAGS]"
-      , "COMPONENTS [FLAGS]"
+      [ "[FLAGS]" ]
+  , commandDefaultFlags = WriteAutogenFilesFlags NoFlag (toFlag normal)
+  , commandOptions      = \showOrParseArgs ->
+      [ optionVerbosity
+        wafVerbosity (\v flags -> flags { wafVerbosity = v })
+
+      , optionDistPref
+        wafDistPref (\d flags -> flags { wafDistPref = d }) showOrParseArgs
       ]
-  , commandDefaultFlags = toFlag normal
-  , commandOptions      = const []
   }
+
+data WriteAutogenFilesFlags = WriteAutogenFilesFlags {
+  wafDistPref :: Flag FilePath,
+  wafVerbosity :: Flag Verbosity
+} deriving Show
 -- ------------------------------------------------------------
 -- * Other Utils
 -- ------------------------------------------------------------

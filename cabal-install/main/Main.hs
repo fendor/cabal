@@ -48,7 +48,7 @@ import Distribution.Client.Setup
          , UserConfigFlags(..), userConfigCommand
          , reportCommand
          , manpageCommand
-         , writeAutogenFilesCommand
+         , WriteAutogenFilesFlags(..), writeAutogenFilesCommand
          )
 import Distribution.Simple.Setup
          ( HaddockTarget(..)
@@ -82,6 +82,7 @@ import qualified Distribution.Client.CmdConfigure as CmdConfigure
 import qualified Distribution.Client.CmdUpdate    as CmdUpdate
 import qualified Distribution.Client.CmdBuild     as CmdBuild
 import qualified Distribution.Client.CmdShowBuildInfo as CmdShowBuildInfo
+import qualified Distribution.Client.CmdWriteAutogenFiles as CmdWriteAutogenFiles
 import qualified Distribution.Client.CmdRepl      as CmdRepl
 import qualified Distribution.Client.CmdFreeze    as CmdFreeze
 import qualified Distribution.Client.CmdHaddock   as CmdHaddock
@@ -330,9 +331,11 @@ mainWorker args = topHandler $
 
       -- ghc-mod supporting commands
       , hiddenCmd showBuildInfoCommand showBuildInfoAction
-      , hiddenCmd  CmdShowBuildInfo.showBuildInfoCommand
-                      CmdShowBuildInfo.showBuildInfoAction
+      , hiddenCmd CmdShowBuildInfo.showBuildInfoCommand
+                    CmdShowBuildInfo.showBuildInfoAction
       , hiddenCmd writeAutogenFilesCommand writeAutogenFilesAction
+      , hiddenCmd CmdWriteAutogenFiles.writeAutogenFilesCommand
+                    CmdWriteAutogenFiles.writeAutogenFilesAction
       ]
 
 type Action = GlobalFlags -> IO ()
@@ -1259,12 +1262,12 @@ manpageAction commands flagVerbosity extraArgs _ = do
   putStrLn $ manpage cabalCmd commands
 
 --Further commands to support ghc-mod usage
-writeAutogenFilesAction :: Flag Verbosity -> [String] -> Action
-writeAutogenFilesAction flagVerbosity _ globalFlags = do
-  let verbosity = fromFlag flagVerbosity
+writeAutogenFilesAction :: WriteAutogenFilesFlags -> [String] -> Action
+writeAutogenFilesAction flags _ globalFlags = do
+  let verbosity = fromFlag (wafVerbosity flags)
   load <- try (loadConfigOrSandboxConfig verbosity globalFlags)
   let config = either (\(SomeException _) -> mempty) snd load
-  distPref <- findSavedDistPref config NoFlag
+  distPref <- findSavedDistPref config (wafDistPref flags)
   pkg <- fmap LBI.localPkgDescr (getPersistBuildConfig distPref)
   eLBI <- tryGetPersistBuildConfig distPref
   case eLBI of
