@@ -26,7 +26,7 @@ import Distribution.Client.SetupWrapper
 import Distribution.Simple.Program ( defaultProgramDb )
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Client.ProjectPlanning.Types
-import Distribution.Client.ProjectPlanning (setupHsBuildFlags, setupHsScriptOptions)
+import Distribution.Client.ProjectPlanning (setupHsBuildFlags, setupHsBuildArgs, setupHsScriptOptions)
 import Distribution.Client.DistDirLayout (distBuildDirectory)
 import Distribution.Types.PackageName (mkPackageName)
 import Distribution.Types.PackageId (pkgName)
@@ -104,12 +104,13 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
 
 
 showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> String -> IO ()
-showInfo verbosity baseCtx buildCtx lock pkgs targetName = setupWrapper verbosity scriptOptions (Just $ elabPkgDescription pkg) (Cabal.showBuildInfoCommand defaultProgramDb) (const flags)  []
+showInfo verbosity baseCtx buildCtx lock pkgs targetName = setupWrapper verbosity scriptOptions (Just $ elabPkgDescription pkg) (Cabal.showBuildInfoCommand defaultProgramDb) (const flags) args
   where pkg = head $ filter isTarget pkgs
         isTarget = (mkPackageName targetName ==) . pkgName . elabPkgSourceId
         shared = elaboratedShared buildCtx
         buildDir = distBuildDirectory (distDirLayout baseCtx) (elabDistDirParams shared pkg)
         flags = setupHsBuildFlags pkg shared verbosity buildDir
+        args    = setupHsBuildArgs pkg
         srcDir = case (elabPkgSourceLocation pkg) of
           LocalUnpackedPackage fp -> fp
           _ -> ""
