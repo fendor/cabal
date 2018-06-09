@@ -105,18 +105,8 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
                     elaboratedPlan
                     targetSelectors
 
-      let elaboratedPlan' = pruneInstallPlanToTargets
-                              TargetActionBuild
-                              targets
-                              elaboratedPlan
-      elaboratedPlan'' <-
-        if buildSettingOnlyDeps (buildSettings baseCtx')
-          then either (reportCannotPruneDependencies verbosity) return $
-                pruneInstallPlanToDependencies (Map.keysSet targets)
-                                              elaboratedPlan'
-          else return elaboratedPlan'
-
-      return (elaboratedPlan'', targets)
+      -- Don't prune the plan though, as we want a list of all configured packages
+      return (elaboratedPlan, targets)
 
   scriptLock <- newLock
   mapM_ (showInfo verbosity baseCtx' buildCtx scriptLock (configured buildCtx)) (fst <$> (Map.toList . targetsMap) buildCtx)
@@ -127,7 +117,7 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
                   installFlags haddockFlags
-    configured ctx = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanToExecute ctx)]
+    configured ctx = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanOriginal ctx)]
 
 
 showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> UnitId -> IO ()
@@ -231,8 +221,3 @@ renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
     renderTargetProblemNoneEnabled "build" targetSelector targets
 renderTargetProblem(TargetProblemNoTargets targetSelector) =
     renderTargetProblemNoTargets "build" targetSelector
-
-reportCannotPruneDependencies :: Verbosity -> CannotPruneDependencies -> IO a
-reportCannotPruneDependencies verbosity =
-    die' verbosity . renderCannotPruneDependencies
-
