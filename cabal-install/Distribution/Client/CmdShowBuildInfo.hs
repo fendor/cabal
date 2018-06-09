@@ -7,6 +7,7 @@ module Distribution.Client.CmdShowBuildInfo (
   ) where
 
 import Distribution.Client.ProjectOrchestration
+import Distribution.Client.CmdErrorMessages
 
 import Distribution.Client.Setup
          ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
@@ -18,7 +19,8 @@ import Distribution.Simple.Command
 import Distribution.Verbosity
          ( Verbosity, silent )
 import Distribution.Simple.Utils
-         ( wrapText)
+         ( wrapText, die')
+import Distribution.Types.UnitId (UnitId)
 
 import qualified Data.Map as Map
 import qualified Distribution.Simple.Setup as Cabal
@@ -26,10 +28,12 @@ import Distribution.Client.SetupWrapper
 import Distribution.Simple.Program ( defaultProgramDb )
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Client.ProjectPlanning.Types
-import Distribution.Client.ProjectPlanning (setupHsBuildFlags, setupHsBuildArgs, setupHsScriptOptions)
+import Distribution.Client.ProjectPlanning (
+  setupHsConfigureFlags, setupHsConfigureArgs,
+  setupHsBuildFlags, setupHsBuildArgs, 
+  setupHsScriptOptions
+  )
 import Distribution.Client.DistDirLayout (distBuildDirectory)
-import Distribution.Types.PackageName (mkPackageName)
-import Distribution.Types.PackageId (pkgName)
 import Distribution.Client.Types ( PackageLocation(..), GenericReadyPackage(..) )
 import Distribution.Client.JobControl (newLock, Lock)
 
@@ -80,19 +84,42 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
             targetStrings globalFlags = do
 
   baseCtx <- establishProjectBaseContext verbosity cliConfig
-
-  buildCtx <-
-    runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan ->
-          return (elaboratedPlan, Map.empty)
-
   let baseCtx' = baseCtx {
                     buildSettings = (buildSettings baseCtx) {
                       buildSettingDryRun = True
                     }
                   }
 
+  targetSelectors <- either (reportTargetSelectorProblems verbosity) return
+                  =<< readTargetSelectors (localPackages baseCtx') targetStrings
+
+  buildCtx <-
+    runProjectPreBuildPhase verbosity baseCtx' $ \elaboratedPlan -> do
+      -- Interpret the targets on the command line as build targets
+      -- (as opposed to say repl or haddock targets).
+      targets <- either (reportTargetProblems verbosity) return
+                $ resolveTargets
+                    selectPackageTargets
+                    selectComponentTarget
+                    TargetProblemCommon
+                    elaboratedPlan
+                    targetSelectors
+
+      let elaboratedPlan' = pruneInstallPlanToTargets
+                              TargetActionBuild
+                              targets
+                              elaboratedPlan
+      elaboratedPlan'' <-
+        if buildSettingOnlyDeps (buildSettings baseCtx')
+          then either (reportCannotPruneDependencies verbosity) return $
+                pruneInstallPlanToDependencies (Map.keysSet targets)
+                                              elaboratedPlan'
+          else return elaboratedPlan'
+
+      return (elaboratedPlan'', targets)
+
   scriptLock <- newLock
-  mapM_ (showInfo verbosity baseCtx' buildCtx scriptLock (configured buildCtx)) targetStrings
+  mapM_ (showInfo verbosity baseCtx' buildCtx scriptLock (configured buildCtx)) (fst <$> (Map.toList . targetsMap) buildCtx)
   
   where
     -- Default to silent verbosity otherwise it will pollute our json output
@@ -100,18 +127,112 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
                   installFlags haddockFlags
-    configured ctx = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanOriginal ctx)]
+    configured ctx = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanToExecute ctx)]
 
 
-showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> String -> IO ()
-showInfo verbosity baseCtx buildCtx lock pkgs targetName = setupWrapper verbosity scriptOptions (Just $ elabPkgDescription pkg) (Cabal.showBuildInfoCommand defaultProgramDb) (const flags) args
-  where pkg = head $ filter isTarget pkgs
-        isTarget = (mkPackageName targetName ==) . pkgName . elabPkgSourceId
+showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> UnitId -> IO ()
+showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId = do
+  
+  --We may need to configure the package first
+  setupWrapper 
+    verbosity 
+    scriptOptions 
+    (Just $ elabPkgDescription pkg) 
+    (Cabal.configureCommand defaultProgramDb) 
+    (const $ configureFlags)
+    configureArgs
+  setupWrapper 
+    verbosity 
+    scriptOptions 
+    (Just $ elabPkgDescription pkg) 
+    (Cabal.showBuildInfoCommand defaultProgramDb) 
+    (const flags) 
+    args
+  where pkg = head $ filter ((targetUnitId ==) . elabUnitId) pkgs
         shared = elaboratedShared buildCtx
         buildDir = distBuildDirectory (distDirLayout baseCtx) (elabDistDirParams shared pkg)
         flags = setupHsBuildFlags pkg shared verbosity buildDir
-        args    = setupHsBuildArgs pkg
+        args = setupHsBuildArgs pkg
         srcDir = case (elabPkgSourceLocation pkg) of
           LocalUnpackedPackage fp -> fp
           _ -> ""
         scriptOptions = setupHsScriptOptions (ReadyPackage pkg) shared srcDir buildDir False lock
+        configureFlags = setupHsConfigureFlags (ReadyPackage pkg) shared verbosity buildDir
+        configureArgs = setupHsConfigureArgs pkg
+
+-- | This defines what a 'TargetSelector' means for the @write-autogen-files@ command.
+-- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
+-- or otherwise classifies the problem.
+--
+-- For the @write-autogen-files@ command select all components except non-buildable and disabled
+-- tests\/benchmarks, fail if there are no such components
+--
+selectPackageTargets :: TargetSelector
+                     -> [AvailableTarget k] -> Either TargetProblem [k]
+selectPackageTargets targetSelector targets
+
+    -- If there are any buildable targets then we select those
+  | not (null targetsBuildable)
+  = Right targetsBuildable
+
+    -- If there are targets but none are buildable then we report those
+  | not (null targets)
+  = Left (TargetProblemNoneEnabled targetSelector targets')
+
+    -- If there are no targets at all then we report that
+  | otherwise
+  = Left (TargetProblemNoTargets targetSelector)
+  where
+    targets'         = forgetTargetsDetail targets
+    targetsBuildable = selectBuildableTargetsWith
+                         (buildable targetSelector)
+                         targets
+
+    -- When there's a target filter like "pkg:tests" then we do select tests,
+    -- but if it's just a target like "pkg" then we don't build tests unless
+    -- they are requested by default (i.e. by using --enable-tests)
+    buildable (TargetPackage _ _  Nothing) TargetNotRequestedByDefault = False
+    buildable (TargetAllPackages  Nothing) TargetNotRequestedByDefault = False
+    buildable _ _ = True
+
+-- | For a 'TargetComponent' 'TargetSelector', check if the component can be
+-- selected.
+--
+-- For the @build@ command we just need the basic checks on being buildable etc.
+--
+selectComponentTarget :: SubComponentTarget
+                      -> AvailableTarget k -> Either TargetProblem k
+selectComponentTarget subtarget =
+    either (Left . TargetProblemCommon) Right
+  . selectComponentTargetBasic subtarget
+
+
+-- | The various error conditions that can occur when matching a
+-- 'TargetSelector' against 'AvailableTarget's for the @build@ command.
+--
+data TargetProblem =
+     TargetProblemCommon       TargetProblemCommon
+
+     -- | The 'TargetSelector' matches targets but none are buildable
+   | TargetProblemNoneEnabled TargetSelector [AvailableTarget ()]
+
+     -- | There are no targets at all
+   | TargetProblemNoTargets   TargetSelector
+  deriving (Eq, Show)
+
+reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
+reportTargetProblems verbosity =
+    die' verbosity . unlines . map renderTargetProblem
+
+renderTargetProblem :: TargetProblem -> String
+renderTargetProblem (TargetProblemCommon problem) =
+    renderTargetProblemCommon "build" problem
+renderTargetProblem (TargetProblemNoneEnabled targetSelector targets) =
+    renderTargetProblemNoneEnabled "build" targetSelector targets
+renderTargetProblem(TargetProblemNoTargets targetSelector) =
+    renderTargetProblemNoTargets "build" targetSelector
+
+reportCannotPruneDependencies :: Verbosity -> CannotPruneDependencies -> IO a
+reportCannotPruneDependencies verbosity =
+    die' verbosity . renderCannotPruneDependencies
+

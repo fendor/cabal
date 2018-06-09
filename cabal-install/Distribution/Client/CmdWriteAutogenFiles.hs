@@ -108,8 +108,7 @@ writeAutogenFiles verbosity baseCtx buildCtx lock pkgs = mapM_ runWrapper pkgs
                 _ -> ""
               scriptOptions = setupHsScriptOptions (ReadyPackage pkg) shared srcDir buildDir False lock
               configureFlags = setupHsConfigureFlags (ReadyPackage pkg) shared verbosity buildDir
-              configureArgs    = setupHsConfigureArgs pkg
-          print (elabPkgSourceId pkg)
+              configureArgs = setupHsConfigureArgs pkg
           --We may need to configure the package first
           setupWrapper 
             verbosity 
