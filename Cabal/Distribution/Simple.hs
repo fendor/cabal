@@ -290,7 +290,6 @@ writeAutogenFilesAction hooks flags _ = do
   distPref <- findDistPrefOrDefault (wafDistPref flags)
   let verbosity = fromFlag $ wafVerbosity flags
   lbi <- getBuildConfig hooks verbosity distPref
-  print $ package (localPkgDescr lbi)
   initialBuildSteps distPref (localPkgDescr lbi) lbi verbosity
 
 replAction :: UserHooks -> ReplFlags -> Args -> IO ()

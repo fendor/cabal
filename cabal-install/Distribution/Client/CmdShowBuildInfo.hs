@@ -36,6 +36,7 @@ import Distribution.Client.ProjectPlanning (
 import Distribution.Client.DistDirLayout (distBuildDirectory)
 import Distribution.Client.Types ( PackageLocation(..), GenericReadyPackage(..) )
 import Distribution.Client.JobControl (newLock, Lock)
+import Distribution.Simple.Configure (tryGetPersistBuildConfig)
 
 showBuildInfoCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
 showBuildInfoCommand = Client.installCommand {
@@ -122,15 +123,17 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
 
 showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> UnitId -> IO ()
 showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId = do
-  
-  --We may need to configure the package first
-  setupWrapper 
-    verbosity 
-    scriptOptions 
-    (Just $ elabPkgDescription pkg) 
-    (Cabal.configureCommand defaultProgramDb) 
-    (const $ configureFlags)
-    configureArgs
+  --Configure the package if there's no existing config, 
+  lbi <- tryGetPersistBuildConfig buildDir
+  case lbi of
+    Left _ -> setupWrapper 
+      verbosity 
+      scriptOptions 
+      (Just $ elabPkgDescription pkg) 
+      (Cabal.configureCommand defaultProgramDb) 
+      (const $ configureFlags)
+      configureArgs
+    Right _ -> pure ()
   setupWrapper 
     verbosity 
     scriptOptions 

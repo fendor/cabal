@@ -20,6 +20,7 @@ import Distribution.Verbosity
          ( Verbosity, normal )
 import Distribution.Simple.Utils
          ( wrapText, die' )
+import Distribution.Simple.Configure (tryGetPersistBuildConfig)
 
 import qualified Data.Map as Map
 import qualified Distribution.Simple.Setup as Cabal
@@ -28,7 +29,7 @@ import Distribution.Simple.Program ( defaultProgramDb )
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Client.ProjectPlanning.Types
 import Distribution.Client.ProjectPlanning (
-  setupHsScriptOptions, setupHsConfigureFlags, setupHsConfigureArgs, setupHsBuildArgs
+  setupHsScriptOptions, setupHsConfigureFlags, setupHsConfigureArgs
   )
 import Distribution.Client.DistDirLayout (distBuildDirectory)
 import Distribution.Client.Types ( PackageLocation(..), GenericReadyPackage(..) )
@@ -86,7 +87,6 @@ writeAutogenFilesAction (configFlags, configExFlags, installFlags, haddockFlags)
 
           return (elaboratedPlan'', targets)
 
-    printPlan normal baseCtx' buildCtx
     scriptLock <- newLock
     writeAutogenFiles verbosity baseCtx' buildCtx scriptLock (configured buildCtx)
     
@@ -109,14 +109,17 @@ writeAutogenFiles verbosity baseCtx buildCtx lock pkgs = mapM_ runWrapper pkgs
               scriptOptions = setupHsScriptOptions (ReadyPackage pkg) shared srcDir buildDir False lock
               configureFlags = setupHsConfigureFlags (ReadyPackage pkg) shared verbosity buildDir
               configureArgs = setupHsConfigureArgs pkg
-          --We may need to configure the package first
-          setupWrapper 
-            verbosity 
-            scriptOptions 
-            (Just $ elabPkgDescription pkg) 
-            (Cabal.configureCommand defaultProgramDb) 
-            (const $ configureFlags)
-            configureArgs
+          --Configure the package if there's no existing config, 
+          lbi <- tryGetPersistBuildConfig buildDir
+          case lbi of
+            Left _ -> setupWrapper 
+              verbosity 
+              scriptOptions 
+              (Just $ elabPkgDescription pkg) 
+              (Cabal.configureCommand defaultProgramDb) 
+              (const $ configureFlags)
+              configureArgs
+            Right _ -> pure ()
           setupWrapper 
             verbosity 
             scriptOptions 
