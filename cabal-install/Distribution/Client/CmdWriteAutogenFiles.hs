@@ -113,12 +113,12 @@ writeAutogenFiles verbosity baseCtx buildCtx lock pkgs = mapM_ runWrapper pkgs
           lbi <- tryGetPersistBuildConfig buildDir
           case lbi of
             Left _ -> setupWrapper 
-              verbosity 
-              scriptOptions 
-              (Just $ elabPkgDescription pkg) 
-              (Cabal.configureCommand defaultProgramDb) 
-              (const $ configureFlags)
-              configureArgs
+                        verbosity 
+                        scriptOptions 
+                        (Just $ elabPkgDescription pkg) 
+                        (Cabal.configureCommand defaultProgramDb) 
+                        (const $ configureFlags)
+                        configureArgs
             Right _ -> pure ()
           setupWrapper 
             verbosity 

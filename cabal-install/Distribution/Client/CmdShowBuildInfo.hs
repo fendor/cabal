@@ -37,6 +37,7 @@ import Distribution.Client.DistDirLayout (distBuildDirectory)
 import Distribution.Client.Types ( PackageLocation(..), GenericReadyPackage(..) )
 import Distribution.Client.JobControl (newLock, Lock)
 import Distribution.Simple.Configure (tryGetPersistBuildConfig)
+import Data.List (find)
 
 showBuildInfoCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
 showBuildInfoCommand = Client.installCommand {
@@ -110,7 +111,7 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
       return (elaboratedPlan, targets)
 
   scriptLock <- newLock
-  mapM_ (showInfo verbosity baseCtx' buildCtx scriptLock (configured buildCtx)) (fst <$> (Map.toList . targetsMap) buildCtx)
+  showTargets verbosity baseCtx' buildCtx scriptLock
   
   where
     -- Default to silent verbosity otherwise it will pollute our json output
@@ -118,31 +119,25 @@ showBuildInfoAction (configFlags, configExFlags, installFlags, haddockFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
                   installFlags haddockFlags
-    configured ctx = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanOriginal ctx)]
 
+-- Pretty nasty piecemeal out of json, but I can't see a way to retrieve output of the setupWrapper'd tasks
+showTargets :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> IO ()
+showTargets verbosity baseCtx buildCtx lock = do
+  putStr "["
+  mapM_ showSeparated (zip [0..] targets)
+  putStrLn "]"
+    where configured = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanOriginal buildCtx)]
+          targets = fst <$> (Map.toList . targetsMap $ buildCtx)
+          doShowInfo unitId = showInfo verbosity baseCtx buildCtx lock configured unitId
+          showSeparated (idx, unitId)
+              | idx == length targets - 1 = doShowInfo unitId
+              | otherwise = doShowInfo unitId >> putStrLn "," 
 
 showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> UnitId -> IO ()
-showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId = do
-  --Configure the package if there's no existing config, 
-  lbi <- tryGetPersistBuildConfig buildDir
-  case lbi of
-    Left _ -> setupWrapper 
-      verbosity 
-      scriptOptions 
-      (Just $ elabPkgDescription pkg) 
-      (Cabal.configureCommand defaultProgramDb) 
-      (const $ configureFlags)
-      configureArgs
-    Right _ -> pure ()
-  setupWrapper 
-    verbosity 
-    scriptOptions 
-    (Just $ elabPkgDescription pkg) 
-    (Cabal.showBuildInfoCommand defaultProgramDb) 
-    (const flags) 
-    args
-  where pkg = head $ filter ((targetUnitId ==) . elabUnitId) pkgs
-        shared = elaboratedShared buildCtx
+showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId
+  | Nothing <- mbPkg = die' verbosity $ "No unit " ++ show targetUnitId 
+  | Just pkg <- mbPkg = do
+    let shared = elaboratedShared buildCtx
         buildDir = distBuildDirectory (distDirLayout baseCtx) (elabDistDirParams shared pkg)
         flags = setupHsBuildFlags pkg shared verbosity buildDir
         args = setupHsBuildArgs pkg
@@ -152,6 +147,25 @@ showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId = do
         scriptOptions = setupHsScriptOptions (ReadyPackage pkg) shared srcDir buildDir False lock
         configureFlags = setupHsConfigureFlags (ReadyPackage pkg) shared verbosity buildDir
         configureArgs = setupHsConfigureArgs pkg
+    --Configure the package if there's no existing config
+    lbi <- tryGetPersistBuildConfig buildDir
+    case lbi of
+      Left _ -> setupWrapper 
+                  verbosity 
+                  scriptOptions 
+                  (Just $ elabPkgDescription pkg) 
+                  (Cabal.configureCommand defaultProgramDb) 
+                  (const $ configureFlags)
+                  configureArgs
+      Right _ -> pure ()
+    setupWrapper 
+      verbosity 
+      scriptOptions 
+      (Just $ elabPkgDescription pkg) 
+      (Cabal.showBuildInfoCommand defaultProgramDb) 
+      (const flags) 
+      args
+    where mbPkg = find ((targetUnitId ==) . elabUnitId) pkgs
 
 -- | This defines what a 'TargetSelector' means for the @write-autogen-files@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
