@@ -1,5 +1,5 @@
 name:          Cabal
-version:       2.3.0.0
+version:       2.5.0.0
 copyright:     2003-2017, Cabal Development Team (see AUTHORS file)
 license:       BSD3
 license-file:  LICENSE
@@ -493,7 +493,7 @@ test-suite unit-tests
     directory,
     filepath,
     integer-logarithms >= 1.0.2 && <1.1,
-    tasty >= 1.0 && < 1.1,
+    tasty >= 1.0 && < 1.2,
     tasty-hunit,
     tasty-quickcheck,
     tagged,
