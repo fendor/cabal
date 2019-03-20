@@ -54,7 +54,7 @@ import qualified Distribution.Simple.PackageIndex as Index
 
 import qualified Distribution.Simple.Build.Macros      as Build.Macros
 import qualified Distribution.Simple.Build.PathsModule as Build.PathsModule
-import qualified Distribution.Simple.Program.HcPkg as HcPkg
+import qualified Distribution.Simple.Program.HcPkg     as HcPkg
 
 import Distribution.Simple.Compiler hiding (Flag)
 import Distribution.PackageDescription hiding (Flag)
@@ -69,7 +69,6 @@ import Distribution.Simple.PreProcess
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Db
-import qualified Distribution.Simple.Program.HcPkg as HcPkg
 import Distribution.Simple.ShowBuildInfo
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Configure
