@@ -142,7 +142,7 @@ import Distribution.Client.GlobalFlags
          ( GlobalFlags(..), defaultGlobalFlags
          , RepoContext(..), withRepoContext
          )
-
+import qualified Distribution.Client.ShowBuildInfo as ShowBuildInfo
 import Data.List
          ( deleteFirstsBy )
 import qualified Data.Set as Set
@@ -196,7 +196,7 @@ globalCommand commands = CommandUI {
           , "outdated"
           , "haddock"
           , "hscolour"
-          , "show-build-info"
+          , "new-show-build-info"
           , "exec"
           , "new-build"
           , "new-configure"
@@ -283,7 +283,7 @@ globalCommand commands = CommandUI {
         , addCmd "upload"
         , addCmd "report"
         , par
-        , addCmd "show-build-info"
+        , addCmd "new-show-build-info"
         , addCmd "freeze"
         , addCmd "gen-bounds"
         , addCmd "outdated"
@@ -2970,4 +2970,4 @@ showBuildInfoCommand = parent {
     setFst a (_,b) = (a,b)
     setSnd b (a,_) = (a,b)
 
-    parent = Cabal.showBuildInfoCommand defaultProgramDb
+    parent = ShowBuildInfo.showBuildInfoCommand defaultProgramDb

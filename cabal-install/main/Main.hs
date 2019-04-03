@@ -454,13 +454,13 @@ buildAction flags@(buildFlags, _) = buildActionForCommand
   flags
   where verbosity = fromFlagOrDefault normal (buildVerbosity buildFlags)
 
-showBuildInfoAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
-showBuildInfoAction flags@(buildFlags, _) = buildActionForCommand
-  (Cabal.showBuildInfoCommand defaultProgramDb)
-  verbosity
-  flags
-    -- Default silent verbosity so as not to pollute json output
-  where verbosity = fromFlagOrDefault silent (buildVerbosity buildFlags)
+-- showBuildInfoAction :: (BuildFlags, BuildExFlags) -> [String] -> Action
+-- showBuildInfoAction flags@(buildFlags, _) = buildActionForCommand
+--   (Cabal.showBuildInfoCommand defaultProgramDb)
+--   verbosity
+--   flags
+--     -- Default silent verbosity so as not to pollute json output
+--   where verbosity = fromFlagOrDefault silent (buildVerbosity buildFlags)
 
 buildActionForCommand :: CommandUI BuildFlags
                       -> Verbosity

@@ -19,7 +19,7 @@
 --
 
 module Distribution.Simple.Build (
-    build, showBuildInfo, repl,
+    build, repl,
     startInterpreter,
 
     initialBuildSteps,
@@ -68,13 +68,11 @@ import Distribution.Simple.PreProcess
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Db
-import Distribution.Simple.ShowBuildInfo
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Configure
 import Distribution.Simple.Register
 import Distribution.Simple.Test.LibV09
 import Distribution.Simple.Utils
-import Distribution.Simple.Utils.Json
 
 import Distribution.System
 import Distribution.Pretty
@@ -127,18 +125,6 @@ build pkg_descr lbi flags suffixes = do
  where
   distPref  = fromFlag (buildDistPref flags)
   verbosity = fromFlag (buildVerbosity flags)
-
-
-showBuildInfo :: PackageDescription  -- ^ Mostly information from the .cabal file
-  -> LocalBuildInfo      -- ^ Configuration information
-  -> BuildFlags          -- ^ Flags that the user passed to build
-  -> IO ()
-showBuildInfo pkg_descr lbi flags = do
-  let verbosity = fromFlag (buildVerbosity flags)
-  targets <- readTargetInfos verbosity pkg_descr lbi (buildArgs flags)
-  let targetsToBuild = neededTargetsInBuildOrder' pkg_descr lbi (map nodeKey targets)
-      doc = mkBuildInfo pkg_descr lbi flags targetsToBuild
-  putStrLn $ renderJson doc ""
 
 
 repl     :: PackageDescription  -- ^ Mostly information from the .cabal file

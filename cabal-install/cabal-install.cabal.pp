@@ -165,6 +165,7 @@ Version:            3.0.0.0
         Distribution.Client.Security.HTTP
         Distribution.Client.Setup
         Distribution.Client.SetupWrapper
+        Distribution.Client.ShowBuildInfo
         Distribution.Client.SolverInstallPlan
         Distribution.Client.SourceFiles
         Distribution.Client.SourceRepoParse

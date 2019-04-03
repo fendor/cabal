@@ -25,6 +25,9 @@ import Distribution.Types.UnitId (UnitId)
 
 import qualified Data.Map as Map
 import qualified Distribution.Simple.Setup as Cabal
+import Distribution.Simple.UserHooks
+import qualified Distribution.Client.CmdConfigure as Configure
+import qualified Distribution.Client.ShowBuildInfo as ShowBuildInfo
 import Distribution.Client.SetupWrapper
 import Distribution.Simple.Program ( defaultProgramDb )
 import qualified Distribution.Client.InstallPlan as InstallPlan
@@ -123,7 +126,13 @@ showTargets verbosity baseCtx buildCtx lock = do
               | idx == length targets - 1 = doShowInfo unitId
               | otherwise = doShowInfo unitId >> putStrLn "," 
 
-showInfo :: Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> [ElaboratedConfiguredPackage] -> UnitId -> IO ()
+showInfo :: Verbosity 
+         -> ProjectBaseContext 
+         -> ProjectBuildContext 
+         -> Lock 
+         -> [ElaboratedConfiguredPackage] 
+         -> UnitId 
+         -> IO ()
 showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId
   | Nothing <- mbPkg = die' verbosity $ "No unit " ++ show targetUnitId 
   | Just pkg <- mbPkg = do
@@ -145,26 +154,17 @@ showInfo verbosity baseCtx buildCtx lock pkgs targetUnitId
             buildDir 
             False 
             lock
-        configureFlags = setupHsConfigureFlags (ReadyPackage pkg) shared verbosity buildDir
+        configureFlags = setupHsConfigureFlags 
+                            (ReadyPackage pkg) shared 
+                            verbosity buildDir
         configureArgs = setupHsConfigureArgs pkg
     --Configure the package if there's no existing config
     lbi <- tryGetPersistBuildConfig buildDir
     case lbi of
-      Left _ -> setupWrapper 
-                  verbosity 
-                  scriptOptions 
-                  (Just $ elabPkgDescription pkg) 
-                  (Cabal.configureCommand defaultProgramDb) 
-                  (const $ configureFlags)
-                  (const configureArgs)
+      Left _ -> Configure.configureAction () args  
       Right _ -> pure ()
-    setupWrapper 
-      verbosity 
-      scriptOptions 
-      (Just $ elabPkgDescription pkg) 
-      (Cabal.showBuildInfoCommand defaultProgramDb) 
-      (const flags) 
-      (const args)
+    ShowBuildInfo.showBuildInfoAction emptyUserHooks flags args
+      
     where mbPkg = find ((targetUnitId ==) . elabUnitId) pkgs
 
 -- | This defines what a 'TargetSelector' means for the @write-autogen-files@ command.
