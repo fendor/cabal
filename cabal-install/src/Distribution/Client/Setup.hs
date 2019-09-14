@@ -50,6 +50,10 @@ module Distribution.Client.Setup
     , copyCommand
     , registerCommand
 
+    --ghc-mod support commands
+    , showBuildInfoCommand
+    , writeAutogenFilesCommand, WriteAutogenFilesFlags(..)
+    , parsePackageArgs
     , liftOptions
     , yesNoOpt
     ) where
@@ -97,6 +101,7 @@ import Distribution.Simple.Setup
          , HaddockFlags(..)
          , CleanFlags(..)
          , CopyFlags(..), RegisterFlags(..)
+         , WriteAutogenFilesFlags(..)
          , readPackageDbList, showPackageDbList
          , BooleanFlag(..), optionVerbosity
          , boolOpt, boolOpt', trueArg, falseArg
@@ -182,6 +187,7 @@ globalCommand commands = CommandUI {
           , "haddock"
           , "hscolour"
           , "show-build-info"
+          , "write-autogen-files"
           , "exec"
           , "new-build"
           , "new-configure"
@@ -269,6 +275,7 @@ globalCommand commands = CommandUI {
         , addCmd "report"
         , par
         , addCmd "show-build-info"
+        , addCmd "write-autogen-files"
         , addCmd "freeze"
         , addCmd "gen-bounds"
         , addCmd "outdated"
@@ -2593,3 +2600,26 @@ relevantConfigValuesText :: [String] -> String
 relevantConfigValuesText vs =
      "Relevant global configuration keys:\n"
   ++ concat ["  " ++ v ++ "\n" |v <- vs]
+
+
+-- ------------------------------------------------------------
+-- * Commands to support ghc-mod
+-- ------------------------------------------------------------
+
+showBuildInfoCommand :: CommandUI (BuildFlags, BuildExFlags)
+showBuildInfoCommand = parent {
+    commandDefaultFlags = (commandDefaultFlags parent, mempty),
+    commandOptions      =
+      \showOrParseArgs -> liftOptions fst setFst
+                          (commandOptions parent showOrParseArgs)
+                          ++
+                          liftOptions snd setSnd (buildExOptions showOrParseArgs)
+  }
+  where
+    setFst a (_,b) = (a,b)
+    setSnd b (a,_) = (a,b)
+
+    parent = Cabal.showBuildInfoCommand defaultProgramDb
+
+writeAutogenFilesCommand :: CommandUI WriteAutogenFilesFlags
+writeAutogenFilesCommand = Cabal.writeAutogenFilesCommand defaultProgramDb
