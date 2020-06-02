@@ -49,7 +49,7 @@ module Distribution.Client.Setup
     , cleanCommand
     , copyCommand
     , registerCommand
-    --, showBuildInfoCommand
+
     , parsePackageArgs
     , liftOptions
     , yesNoOpt
@@ -98,6 +98,7 @@ import Distribution.Simple.Setup
          , HaddockFlags(..)
          , CleanFlags(..)
          , CopyFlags(..), RegisterFlags(..)
+         , ShowBuildInfoFlags(..)
          , readPackageDbList, showPackageDbList
          , BooleanFlag(..), optionVerbosity
          , boolOpt, boolOpt', trueArg, falseArg
@@ -2551,9 +2552,18 @@ usageFlags :: String -> String -> String
 usageFlags name pname =
   "Usage: " ++ pname ++ " " ++ name ++ " [FLAGS]\n"
 
+--TODO: do we want to allow per-package flags?
+parsePackageArgs :: [String] -> Either String [PackageVersionConstraint]
+parsePackageArgs = traverse p where
+    p arg = case eitherParsec arg of
+        Right pvc -> Right pvc
+        Left err  -> Left $
+          show arg ++ " is not valid syntax for a package name or"
+                   ++ " package dependency. " ++ err
+
 -- ------------------------------------------------------------
 -- * Repo helpers
--- ------------------------------------------------------------
+-- ------------------------------------------------------------bution/Client/Setup.hs
 
 showRemoteRepo :: RemoteRepo -> String
 showRemoteRepo = prettyShow
@@ -2581,17 +2591,11 @@ relevantConfigValuesText vs =
 -- * Commands to support show-build-info
 -- ------------------------------------------------------------
 
-showBuildInfoCommand :: CommandUI (Cabal.ShowBuildInfoFlags, BuildExFlags)
+showBuildInfoCommand :: CommandUI ShowBuildInfoFlags
 showBuildInfoCommand = parent {
-    commandDefaultFlags = (commandDefaultFlags parent, mempty),
+    commandDefaultFlags = commandDefaultFlags parent,
     commandOptions      =
-      \showOrParseArgs -> liftOptions fst setFst
-                          (commandOptions parent showOrParseArgs)
-                          ++
-                          liftOptions snd setSnd (buildExOptions showOrParseArgs)
+      \showOrParseArgs -> commandOptions parent showOrParseArgs
   }
   where
-    setFst a (_,b) = (a,b)
-    setSnd b (a,_) = (a,b)
-
     parent = Cabal.showBuildInfoCommand defaultProgramDb
