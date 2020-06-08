@@ -55,11 +55,18 @@ import Distribution.Simple.Configure
 import Distribution.Simple.ShowBuildInfo
 import Distribution.Utils.Json
 
-import Distribution.Simple.BuildTarget (readTargetInfos)
-import Distribution.Types.LocalBuildInfo (neededTargetsInBuildOrder')
-import Distribution.Compat.Graph (IsNode(nodeKey))
-import Distribution.Simple.Setup (BuildFlags(buildArgs))
-import Distribution.Types.TargetInfo (TargetInfo(targetCLBI))
+import Distribution.Simple.BuildTarget
+        ( readTargetInfos )
+import Distribution.Types.LocalBuildInfo
+        ( neededTargetsInBuildOrder' )
+import Distribution.Compat.Graph
+        ( IsNode(nodeKey) )
+import Distribution.Simple.Setup
+        ( BuildFlags(..) )
+import Distribution.Types.TargetInfo
+        ( TargetInfo(..) )
+import Distribution.Simple.Build
+        ( componentInitialBuildSteps )
 
 showBuildInfoCommand :: CommandUI (NixStyleFlags ShowBuildInfoFlags)
 showBuildInfoCommand = CommandUI {
@@ -114,7 +121,7 @@ showBuildInfoAction flags@NixStyleFlags { extraFlags = (ShowBuildInfoFlags fileO
         }
 
   targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                  =<< readTargetSelectors (localPackages baseCtx') AmbiguityResolverFirst targetStrings
+                  =<< readTargetSelectors (localPackages baseCtx') Nothing flags targetStrings
 
   buildCtx <-
     runProjectPreBuildPhase verbosity baseCtx' $ \elaboratedPlan -> do
@@ -155,6 +162,8 @@ showBuildInfoAction flags@NixStyleFlags { extraFlags = (ShowBuildInfoFlags fileO
 
 showTargets :: Maybe FilePath -> Maybe [String] -> Verbosity -> ProjectBaseContext -> ProjectBuildContext -> Lock -> IO ()
 showTargets fileOutput unitIds verbosity baseCtx buildCtx lock = do
+
+  -- TODO: can we use --disable-per-component so that we only get one package?
   let configured = [p | InstallPlan.Configured p <- InstallPlan.toList (elaboratedPlanOriginal buildCtx)]
       targets = maybe (fst <$> (Map.toList . targetsMap $ buildCtx)) (map mkUnitId) unitIds
 
@@ -223,6 +232,12 @@ getComponentInfo verbosity baseCtx buildCtx lock pkgs targetUnitId =
       let pkgDesc = elabPkgDescription pkg
       targets <- readTargetInfos verbosity pkgDesc lbi (buildArgs flags)
       let targetsToBuild = neededTargetsInBuildOrder' pkgDesc lbi (map nodeKey targets)
+
+      -- generate autogen files which will be needed by tooling
+      flip mapM_ targetsToBuild $ \target ->
+        componentInitialBuildSteps (Cabal.fromFlag (buildDistPref flags))
+          pkgDesc lbi (targetCLBI target) verbosity
+
       return $ map (mkComponentInfo pkgDesc lbi . targetCLBI) targetsToBuild
 
     where
