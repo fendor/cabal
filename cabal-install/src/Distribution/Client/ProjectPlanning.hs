@@ -57,6 +57,8 @@ module Distribution.Client.ProjectPlanning (
     setupHsRegisterFlags,
     setupHsHaddockFlags,
     setupHsHaddockArgs,
+    setupHsShowBuildInfoFlags,
+    setupHsShowBuildInfoArgs,
 
     packageHashInputs,
 
@@ -1758,7 +1760,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
             -- package needs to be rebuilt.  (It needs to be done here,
             -- because the ElaboratedConfiguredPackage is where we test
             -- whether or not there have been changes.)
-            TestStanzas  -> listToMaybe [ v | v <- maybeToList tests, _ <- PD.testSuites elabPkgDescription ] 
+            TestStanzas  -> listToMaybe [ v | v <- maybeToList tests, _ <- PD.testSuites elabPkgDescription ]
             BenchStanzas -> listToMaybe [ v | v <- maybeToList benchmarks, _ <- PD.benchmarks elabPkgDescription ]
           where
             tests, benchmarks :: Maybe Bool
@@ -1779,6 +1781,7 @@ elaborateInstallPlan verbosity platform compiler compilerprogdb pkgConfigDB
         elabBenchTargets    = []
         elabReplTarget      = Nothing
         elabHaddockTargets  = []
+        elabBuildInfoTargets = []
 
         elabBuildHaddocks   =
           perPkgOptionFlag pkgid False packageConfigDocumentation
@@ -2568,6 +2571,7 @@ data TargetAction = TargetActionConfigure
                   | TargetActionTest
                   | TargetActionBench
                   | TargetActionHaddock
+                  | TargetActionBuildInfo
 
 -- | Given a set of per-package\/per-component targets, take the subset of the
 -- install plan needed to build those targets. Also, update the package config
@@ -2645,6 +2649,7 @@ setRootTargets targetAction perPkgTargetsMap =
         (Just tgts,  TargetActionHaddock) ->
           foldr setElabHaddockTargets (elab { elabHaddockTargets = tgts
                                             , elabBuildHaddocks = True }) tgts
+        (Just tgts,  TargetActionBuildInfo) -> elab { elabBuildInfoTargets = tgts }
         (Just _,     TargetActionRepl)    ->
           error "pruneInstallPlanToTargets: multiple repl targets"
 
@@ -2692,10 +2697,21 @@ pruneInstallPlanPass1 pkgs =
           then Just (installedUnitId elab)
           else Nothing
 
-    find_root (InstallPlan.Configured pkg) = is_root pkg
     -- When using the extra-packages stanza we need to
     -- look at installed packages as well.
     find_root (InstallPlan.Installed pkg)  = is_root pkg
+    find_root (InstallPlan.Configured (PrunedPackage elab _)) =
+        if not $ and [ null (elabConfigureTargets elab)
+                     , null (elabBuildTargets elab)
+                     , null (elabTestTargets elab)
+                     , null (elabBenchTargets elab)
+                     , isNothing (elabReplTarget elab)
+                     , null (elabHaddockTargets elab)
+                     , null (elabBuildInfoTargets elab)
+                     ]
+            then Just (installedUnitId elab)
+            else Nothing
+    find_root (InstallPlan.Configured pkg) = is_root pkg
     find_root _ = Nothing
 
     -- Note [Sticky enabled testsuites]
@@ -3602,6 +3618,22 @@ setupHsHaddockArgs :: ElaboratedConfiguredPackage -> [String]
 -- TODO: Does the issue #3335 affects test as well
 setupHsHaddockArgs elab =
   map (showComponentTarget (packageId elab)) (elabHaddockTargets elab)
+
+setupHsShowBuildInfoFlags :: ElaboratedConfiguredPackage
+                          -> ElaboratedSharedConfig
+                          -> Verbosity
+                          -> FilePath
+                          -> Cabal.ShowBuildInfoFlags
+setupHsShowBuildInfoFlags pkg config verbosity builddir =
+  Cabal.ShowBuildInfoFlags {
+    buildInfoBuildFlags     = setupHsBuildFlags pkg config verbosity builddir,
+    buildInfoOutputFile     = Nothing,
+    buildInfoComponentsOnly = toFlag True
+  }
+
+setupHsShowBuildInfoArgs :: ElaboratedConfiguredPackage -> [String]
+setupHsShowBuildInfoArgs elab =
+  map (showComponentTarget (packageId elab)) (elabBuildInfoTargets elab)
 
 {-
 setupHsTestFlags :: ElaboratedConfiguredPackage
