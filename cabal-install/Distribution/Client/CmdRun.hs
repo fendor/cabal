@@ -240,7 +240,7 @@ runAction flags@NixStyleFlags {..} targetStrings globalFlags = do
 
     printPlan verbosity baseCtx' buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx' buildCtx
+    buildOutcomes <- runProjectBuildPhase verbosity baseCtx' buildCtx NoRepl
     runProjectPostBuildPhase verbosity baseCtx' buildCtx buildOutcomes
 
 

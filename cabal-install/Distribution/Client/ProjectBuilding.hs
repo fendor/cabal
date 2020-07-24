@@ -1,3 +1,4 @@
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE ConstraintKinds     #-}
@@ -36,6 +37,7 @@ module Distribution.Client.ProjectBuilding (
     BuildResult(..),
     BuildFailure(..),
     BuildFailureReason(..),
+    IsRepl(..),
   ) where
 
 import Distribution.Client.Compat.Prelude
@@ -75,7 +77,7 @@ import           Distribution.Package
 import qualified Distribution.PackageDescription as PD
 import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import qualified Distribution.InstalledPackageInfo as Installed
-import           Distribution.Simple.BuildPaths (haddockDirName)
+import           Distribution.Simple.BuildPaths (objExtension, haddockDirName)
 import qualified Distribution.Simple.InstallDirs as InstallDirs
 import           Distribution.Types.BuildType
 import           Distribution.Types.PackageDescription.Lens (componentModules)
@@ -84,7 +86,6 @@ import qualified Distribution.Simple.Setup as Cabal
 import           Distribution.Simple.Command (CommandUI)
 import qualified Distribution.Simple.Register as Cabal
 import           Distribution.Simple.LocalBuildInfo
-                   ( ComponentName(..), LibraryName(..) )
 import           Distribution.Simple.Compiler
                    ( Compiler, compilerId, PackageDB(..) )
 
@@ -104,6 +105,19 @@ import System.FilePath   (dropDrive, makeRelative, normalise, takeDirectory, (<.
 import System.IO         (IOMode (AppendMode), withFile)
 
 import Distribution.Compat.Directory (listDirectory)
+import Distribution.Simple.Configure
+import Distribution.Simple.BuildTarget
+import Distribution.Simple.Build
+
+import Distribution.Simple.GHC
+import Distribution.Types.TargetInfo (targetCLBI, TargetInfo(targetComponent))
+import Distribution.Simple.Program.GHC
+import qualified Distribution.Simple.GHC.Internal as GhcInternal
+import Distribution.Utils.NubList
+import Distribution.Types.BuildInfo
+import System.FilePath.Posix (replaceExtension)
+import Distribution.Simple.PreProcess (preprocessExtras)
+import Distribution.Types.Library (Library(libBuildInfo))
 
 
 ------------------------------------------------------------------------------
@@ -526,6 +540,11 @@ invalidatePackageRegFileMonitor PackageFileMonitor{pkgFileMonitorReg} =
 -- * Doing it: executing an 'ElaboratedInstallPlan'
 ------------------------------------------------------------------------------
 
+data IsRepl
+  = NoRepl
+  | Repl UnitId [UnitId]
+  deriving (Show, Eq)
+
 -- Refer to ProjectBuilding.Types for details of these important types:
 
 -- type BuildOutcomes = ...
@@ -545,6 +564,7 @@ rebuildTargets :: Verbosity
                -> ElaboratedSharedConfig
                -> BuildStatusMap
                -> BuildTimeSettings
+               -> IsRepl
                -> IO BuildOutcomes
 rebuildTargets verbosity
                distDirLayout@DistDirLayout{..}
@@ -552,13 +572,15 @@ rebuildTargets verbosity
                installPlan
                sharedPackageConfig@ElaboratedSharedConfig {
                  pkgConfigCompiler      = compiler,
+                 pkgConfigPlatform      = platform,
                  pkgConfigCompilerProgs = progdb
                }
                pkgsBuildStatus
                buildSettings@BuildTimeSettings{
                  buildSettingNumJobs,
                  buildSettingKeepGoing
-               } = do
+               }
+               repl = do
 
     -- Concurrency control: create the job controller and concurrency limits
     -- for downloading, building and installing.
@@ -579,22 +601,27 @@ rebuildTargets verbosity
     createDirectoryIfMissingVerbose verbosity True distTempDirectory
     traverse_ (createPackageDBIfMissing verbosity compiler progdb) packageDBsToUse
 
+    let
+      relevantIds = case repl of
+        NoRepl -> Set.empty
+        Repl root rest -> Set.fromList $ root : rest
+
     -- Before traversing the install plan, pre-emptively find all packages that
     -- will need to be downloaded and start downloading them.
-    asyncDownloadPackages verbosity withRepoCtx
+    buildOutcomes' <- asyncDownloadPackages verbosity withRepoCtx
                           installPlan pkgsBuildStatus $ \downloadMap ->
 
       -- For each package in the plan, in dependency order, but in parallel...
       InstallPlan.execute jobControl keepGoing
                           (BuildFailure Nothing . DependentFailed . packageId)
-                          installPlan $ \pkg ->
+                          installPlan $ \pkg@(ReadyPackage p) ->
         --TODO: review exception handling
-        handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $
+        handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $ do
 
         let uid = installedUnitId pkg
-            pkgBuildStatus = Map.findWithDefault (error "rebuildTargets") uid pkgsBuildStatus in
+            pkgBuildStatus = Map.findWithDefault (error "rebuildTargets") uid pkgsBuildStatus
 
-        rebuildTarget
+        (b, builddir) <- rebuildTarget
           verbosity
           distDirLayout
           storeDirLayout
@@ -603,6 +630,36 @@ rebuildTargets verbosity
           sharedPackageConfig
           installPlan pkg
           pkgBuildStatus
+        if elabUnitId p `Set.member` relevantIds
+          then do
+            lbi <- getPersistBuildConfig builddir
+            let t = setupHsReplArgs p
+            [tinfo] <- readTargetInfos verbosity (localPkgDescr lbi) lbi t
+            let comp = targetComponent tinfo
+                clbi = targetCLBI tinfo
+                filterInteractive = filter (/= "--interactive")
+            replGhcOpts <- replOptsComponent verbosity (elabUnitId p) [] (localPkgDescr lbi) lbi comp clbi
+
+            pure (b, Just (elabUnitId p, filterInteractive $ renderGhcOptions compiler platform replGhcOpts))
+          else
+            pure (b, Nothing)
+
+    let buildOutcomes = fmap (fmap fst) buildOutcomes'
+        lbiMap = fmap (fmap snd) buildOutcomes'
+        ghcOpts :: Map UnitId [String]
+        ghcOpts = Map.fromList $ mapMaybe (join . rightToMaybe) $ Map.elems lbiMap
+
+    case repl of
+      NoRepl -> pure ()
+      Repl root _ -> do
+        (ghcProg, _) <- requireProgram verbosity ghcProgram progdb
+        newGhcOpts <- for (Map.assocs ghcOpts) $ \(unit, opts) -> do
+          writeFile (unUnitId unit) $ unlines opts
+          pure ["-unit", "@" ++ unUnitId unit]
+
+        runProgramInvocation verbosity $ programInvocation ghcProg $ join newGhcOpts
+
+    pure buildOutcomes
   where
     isParallelBuild = buildSettingNumJobs >= 2
     keepGoing       = buildSettingKeepGoing
@@ -617,6 +674,149 @@ rebuildTargets verbosity
                           , elabSetupPackageDBStack elab ]
         ]
 
+replOptsComponent :: Verbosity -> UnitId -> [String] -> PD.PackageDescription -> LocalBuildInfo -> Component -> ComponentLocalBuildInfo -> IO GhcOptions
+replOptsComponent verbosity unitId replFlags _pkg_descr lbi comp clbi =
+  case comp of
+    CLib lib -> do
+      extras <- preprocessExtras verbosity comp lbi
+      let
+        libbi = libBuildInfo lib
+        lib' = lib { libBuildInfo = libbi { cSources = cSources libbi ++ extras } }
+        ghcOpts = baseOpts libbi
+      pure $ buildReplLibOpts lib' lbi libbi clbi replFlags ghcOpts
+
+    CFLib _flib -> undefined
+
+    CBench bm -> do
+      let exe = benchmarkExeV10asExe bm
+      extras <- preprocessExtras verbosity comp lbi
+      let ebi = PD.buildInfo exe
+          exe' = exe { PD.buildInfo = ebi { cSources = cSources ebi ++ extras } }
+          buildMode = GReplExe replFlags exe'
+          ghcOpts = baseOpts ebi
+      buildReplOpts verbosity lbi buildMode ebi ghcOpts
+
+    CExe exe -> do
+      extras <- preprocessExtras verbosity comp lbi
+      let ebi = PD.buildInfo exe
+          exe' = exe { PD.buildInfo = ebi { cSources = cSources ebi ++ extras } }
+          buildMode = GReplExe replFlags exe'
+          ghcOpts = baseOpts ebi
+      buildReplOpts verbosity lbi buildMode ebi ghcOpts
+    CTest test -> do
+      let exe = testSuiteExeV10AsExe test
+      extras <- preprocessExtras verbosity comp lbi
+      let ebi = PD.buildInfo exe
+          exe' = exe { PD.buildInfo = ebi { cSources = cSources ebi ++ extras } }
+          buildMode = GReplExe replFlags exe'
+          ghcOpts = baseOpts ebi
+      buildReplOpts verbosity lbi buildMode ebi ghcOpts
+  where
+    baseOpts buildInfo = (componentGhcOptions verbosity lbi buildInfo clbi (buildDir lbi))
+      { ghcOptThisUnitId = Cabal.toFlag $ unUnitId unitId }
+
+buildReplOpts :: Verbosity -> LocalBuildInfo -> GBuildMode -> BuildInfo -> GhcOptions -> IO GhcOptions
+buildReplOpts verbosity lbi bm bnfo baseOpts = do
+  let
+    replFlags = case bm of
+          GReplExe flags _  -> flags
+          GReplFLib flags _ -> flags
+          GBuildExe{}       -> mempty
+          GBuildFLib{}      -> mempty
+    tmpDir     = targetDir    </> (gbuildName bm ++ "-tmp")
+    targetDir  = buildDir lbi </> (gbuildName bm)
+  createDirectoryIfMissing True tmpDir
+  buildSources <- gbuildSources verbosity (PD.specVersion $ localPkgDescr lbi) tmpDir bm
+  let
+    cSrcs               = cSourcesFiles buildSources
+    cxxSrcs             = cxxSourceFiles buildSources
+    inputFiles          = inputSourceFiles buildSources
+    inputModules        = inputSourceModules buildSources
+    cObjs               = map (`replaceExtension` objExtension) cSrcs
+    cxxObjs             = map (`replaceExtension` objExtension) cxxSrcs
+    vanillaOpts = baseOpts `mappend` mempty {
+                      ghcOptInputFiles   = toNubListR inputFiles,
+                      ghcOptInputModules = toNubListR inputModules
+                    }
+    linkerOpts = mempty {
+                ghcOptLinkOptions       = PD.ldOptions bnfo
+                                          ++ [ "-static"
+                                              | withFullyStaticExe lbi ]
+                                          -- Pass extra `ld-options` given
+                                          -- through to GHC's linker.
+                                          ++ maybe [] programOverrideArgs
+                                                (lookupProgram ldProgram (withPrograms lbi)),
+                ghcOptLinkLibs          = extraLibs bnfo,
+                ghcOptLinkLibPath       = toNubListR $ extraLibDirs bnfo,
+                ghcOptLinkFrameworks    = toNubListR $
+                                          PD.frameworks bnfo,
+                ghcOptLinkFrameworkDirs = toNubListR $
+                                          PD.extraFrameworkDirs bnfo,
+                ghcOptInputFiles     = toNubListR
+                                        [tmpDir </> x | x <- cObjs ++ cxxObjs]
+              }
+  pure $ vanillaOpts {
+              ghcOptExtra            = GhcInternal.filterGhciFlags
+                                        (ghcOptExtra baseOpts)
+                                        <> replFlags
+              }
+              -- For a normal compile we do separate invocations of ghc for
+              -- compiling as for linking. But for repl we have to do just
+              -- the one invocation, so that one has to include all the
+              -- linker stuff too, like -l flags and any .o files from C
+              -- files etc.
+              `mappend` linkerOpts
+              `mappend` mempty {
+                ghcOptMode         = Cabal.toFlag GhcModeInteractive,
+                ghcOptOptimisation = Cabal.toFlag GhcNoOptimisation
+                }
+
+-- buildReplLibOpts :: Library -> LocalBuildInfo -> BuildInfo -> ComponentLocalBuildInfo -> [String] -> GhcOptions -> GhcOptions
+buildReplLibOpts :: Library -> LocalBuildInfo -> BuildInfo -> ComponentLocalBuildInfo -> [String] -> GhcOptions -> GhcOptions
+buildReplLibOpts lib lbi libBi clbi replFlags baseOpts = replOpts
+  where
+    vanillaOpts = baseOpts `mappend` mempty {
+                      ghcOptInputModules = toNubListR $ allLibModules lib clbi
+                    }
+    linkerOpts = mempty {
+                ghcOptLinkOptions       = PD.ldOptions libBi
+                                          ++ [ "-static"
+                                              | withFullyStaticExe lbi ]
+                                          -- Pass extra `ld-options` given
+                                          -- through to GHC's linker.
+                                          ++ maybe [] programOverrideArgs
+                                                (lookupProgram ldProgram (withPrograms lbi)),
+                ghcOptLinkLibs          = extraLibs libBi,
+                ghcOptLinkLibPath       = toNubListR $ extraLibDirs libBi,
+                ghcOptLinkFrameworks    = toNubListR $ PD.frameworks libBi,
+                ghcOptLinkFrameworkDirs = toNubListR $
+                                          PD.extraFrameworkDirs libBi,
+                ghcOptInputFiles     = toNubListR
+                                        [(componentBuildDir lbi clbi) </> x | x <- cObjs]
+              }
+    replOpts    = vanillaOpts {
+                      ghcOptExtra        = GhcInternal.filterGhciFlags
+                                           (ghcOptExtra vanillaOpts)
+                                           <> replFlags,
+                      ghcOptNumJobs      = mempty
+                    }
+                    `mappend` linkerOpts
+                    `mappend` mempty {
+                      ghcOptMode         = Cabal.toFlag GhcModeInteractive,
+                      ghcOptOptimisation = Cabal.toFlag GhcNoOptimisation
+                    }
+    cLikeFiles  = fromNubListR $ mconcat
+                      [ toNubListR (cSources   libBi)
+                      , toNubListR (cxxSources libBi)
+                      , toNubListR (cmmSources libBi)
+                      , toNubListR (asmSources libBi)
+                      ]
+    cObjs       = map (`replaceExtension` objExtension) cLikeFiles
+
+
+rightToMaybe :: Either e a -> Maybe a
+rightToMaybe (Left _) = Nothing
+rightToMaybe (Right a) = Just a
 
 -- | Create a package DB if it does not currently exist. Note that this action
 -- is /not/ safe to run concurrently.
@@ -644,7 +844,7 @@ rebuildTarget :: Verbosity
               -> ElaboratedInstallPlan
               -> ElaboratedReadyPackage
               -> BuildStatus
-              -> IO BuildResult
+              -> IO (BuildResult, FilePath)
 rebuildTarget verbosity
               distDirLayout@DistDirLayout{distBuildDirectory}
               storeDirLayout
@@ -701,7 +901,7 @@ rebuildTarget verbosity
                    (elabDistDirParams sharedPackageConfig pkg)
 
     buildAndInstall srcdir builddir =
-        buildAndInstallUnpackedPackage
+        (, builddir') <$> buildAndInstallUnpackedPackage
           verbosity distDirLayout storeDirLayout
           buildSettings registerLock cacheLock
           sharedPackageConfig
@@ -713,7 +913,7 @@ rebuildTarget verbosity
 
     buildInplace buildStatus srcdir builddir =
         --TODO: [nice to have] use a relative build dir rather than absolute
-        buildInplaceUnpackedPackage
+        (, builddir) <$> buildInplaceUnpackedPackage
           verbosity distDirLayout
           buildSettings registerLock cacheLock
           sharedPackageConfig
@@ -1214,6 +1414,7 @@ buildInplaceUnpackedPackage verbosity
             buildResult = (docsResult, testsResult)
 
         whenRebuild $ do
+          putStrLn "buildInplaceUnpackedPackage: Called rebuild"
           timestamp <- beginUpdateFileMonitor
           annotateFailureNoLog BuildFailed $
             setup buildCommand buildFlags buildArgs
@@ -1282,9 +1483,9 @@ buildInplaceUnpackedPackage verbosity
 
         -- Repl phase
         --
-        whenRepl $
-          annotateFailureNoLog ReplFailed $
-          setupInteractive replCommand replFlags replArgs
+        -- whenRepl $
+        --   annotateFailureNoLog ReplFailed $
+        --   setupInteractive replCommand replFlags replArgs
 
         -- Haddock phase
         whenHaddock $
@@ -1332,9 +1533,9 @@ buildInplaceUnpackedPackage verbosity
       | null (elabBenchTargets pkg) = return ()
       | otherwise                   = action
 
-    whenRepl action
-      | isNothing (elabReplTarget pkg) = return ()
-      | otherwise                     = action
+    -- whenRepl action
+    --  | isNothing (elabReplTarget pkg) = return ()
+    --  | otherwise                     = action
 
     whenHaddock action
       | hasValidHaddockTargets pkg = action
@@ -1372,10 +1573,10 @@ buildInplaceUnpackedPackage verbosity
                                           verbosity builddir
     benchArgs     _  = setupHsBenchArgs  pkg
 
-    replCommand      = Cabal.replCommand defaultProgramDb
-    replFlags _      = setupHsReplFlags pkg pkgshared
-                                        verbosity builddir
-    replArgs _       = setupHsReplArgs  pkg
+    -- replCommand      = Cabal.replCommand defaultProgramDb
+    -- replFlags _      = setupHsReplFlags pkg pkgshared
+    --                                     verbosity builddir
+    -- replArgs _       = setupHsReplArgs  pkg
 
     haddockCommand   = Cabal.haddockCommand
     haddockFlags v   = flip filterHaddockFlags v $

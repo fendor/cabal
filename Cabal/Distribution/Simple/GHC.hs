@@ -67,7 +67,12 @@ module Distribution.Simple.GHC (
         ParseErrorExc(..),
         -- * Version-specific implementation quirks
         getImplInfo,
-        GhcImplInfo(..)
+        GhcImplInfo(..),
+        BuildSources(..),
+        gbuildSources,
+        gbuildName,
+        gbuildInfo,
+        GBuildMode(..),
  ) where
 
 import Prelude ()

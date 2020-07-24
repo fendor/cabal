@@ -99,6 +99,8 @@ module Distribution.Client.ProjectOrchestration (
     -- * Dummy projects
     establishDummyProjectBaseContext,
     establishDummyDistDirLayout,
+
+    IsRepl(..),
   ) where
 
 import Prelude ()
@@ -367,13 +369,14 @@ runProjectPreBuildPhase
 runProjectBuildPhase :: Verbosity
                      -> ProjectBaseContext
                      -> ProjectBuildContext
+                     -> IsRepl
                      -> IO BuildOutcomes
-runProjectBuildPhase _ ProjectBaseContext{buildSettings} _
+runProjectBuildPhase _ ProjectBaseContext{buildSettings} _ _
   | buildSettingDryRun buildSettings
   = return Map.empty
 
 runProjectBuildPhase verbosity
-                     ProjectBaseContext{..} ProjectBuildContext {..} =
+                     ProjectBaseContext{..} ProjectBuildContext {..} repl =
     fmap (Map.union (previousBuildOutcomes pkgsBuildStatus)) $
     rebuildTargets verbosity
                    distDirLayout
@@ -382,6 +385,8 @@ runProjectBuildPhase verbosity
                    elaboratedShared
                    pkgsBuildStatus
                    buildSettings
+                   repl
+
   where
     previousBuildOutcomes :: BuildStatusMap -> BuildOutcomes
     previousBuildOutcomes =

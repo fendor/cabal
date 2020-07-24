@@ -376,7 +376,7 @@ installAction flags@NixStyleFlags { extraFlags = clientInstallFlags', .. } targe
 
     printPlan verbosity baseCtx buildCtx
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
+    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx NoRepl
     runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
 
     -- Now that we built everything we can do the installation part.

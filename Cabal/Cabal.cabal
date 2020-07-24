@@ -586,6 +586,7 @@ library
     Distribution.Types.SetupBuildInfo.Lens
     Distribution.Types.SourceRepo.Lens
     Distribution.Types.TestSuite.Lens
+    Distribution.Simple.GHC.Internal
 
   other-modules:
     Distribution.Backpack.PreExistingComponent
@@ -607,7 +608,6 @@ library
     Distribution.Utils.String
     Distribution.Simple.Build.Macros.Z
     Distribution.Simple.GHC.EnvironmentParser
-    Distribution.Simple.GHC.Internal
     Distribution.Simple.GHC.ImplInfo
     Distribution.Simple.Utils.Json
     Distribution.ZinzaPrelude
@@ -689,7 +689,7 @@ test-suite unit-tests
     Distribution.Described
     Distribution.Utils.CharSet
     Distribution.Utils.GrammarRegex
-    
+
   main-is: UnitTests.hs
   build-depends:
     array,

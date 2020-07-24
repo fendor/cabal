@@ -26,6 +26,8 @@ module Distribution.Simple.Build (
     createInternalPackageDB,
     componentInitialBuildSteps,
     writeAutogenFiles,
+    testSuiteExeV10AsExe,
+    benchmarkExeV10asExe,
   ) where
 
 import Prelude ()

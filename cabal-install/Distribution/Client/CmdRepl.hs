@@ -102,6 +102,7 @@ import Distribution.CabalSpecVersion
 
 import Data.List
          ( (\\) )
+import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import System.Directory
@@ -223,7 +224,7 @@ replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetS
         -- especially in the no-project case.
         withInstallPlan (lessVerbose verbosity) baseCtx $ \elaboratedPlan _ -> do
           -- targets should be non-empty map, but there's no NonEmptyMap yet.
-          targets <- validatedTargets elaboratedPlan targetSelectors
+          (targets, _) <- validatedTargets elaboratedPlan targetSelectors
 
           let
             (unitId, _) = fromMaybe (error "panic: targets should be non-empty") $ safeHead $ Map.toList targets
@@ -242,12 +243,12 @@ replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetS
     -- In addition, to avoid a *third* trip through the solver, we are
     -- replicating the second half of 'runProjectPreBuildPhase' by hand
     -- here.
-    (buildCtx, replFlags'') <- withInstallPlan verbosity baseCtx' $
+    (buildCtx, replFlags'', isRepl) <- withInstallPlan verbosity baseCtx' $
       \elaboratedPlan elaboratedShared' -> do
         let ProjectBaseContext{..} = baseCtx'
 
         -- Recalculate with updated project.
-        targets <- validatedTargets elaboratedPlan targetSelectors
+        (targets, isRepl) <- validatedTargets elaboratedPlan targetSelectors
 
         let
           elaboratedPlan' = pruneInstallPlanToTargets
@@ -287,7 +288,7 @@ replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetS
               , version >= minGhciScriptVersion -> ("-ghci-script" ++ scriptPath) : replFlags'
             _                                   -> replFlags'
 
-        return (buildCtx, replFlags'')
+        return (buildCtx, replFlags'', isRepl)
 
     let buildCtx' = buildCtx
           { elaboratedShared = (elaboratedShared buildCtx)
@@ -295,7 +296,7 @@ replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetS
           }
     printPlan verbosity baseCtx' buildCtx'
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx' buildCtx'
+    buildOutcomes <- runProjectBuildPhase verbosity baseCtx' buildCtx' isRepl
     runProjectPostBuildPhase verbosity baseCtx' buildCtx' buildOutcomes
     finalizer
   where
@@ -304,6 +305,13 @@ replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetS
     cliConfig = commandLineFlagsToProjectConfig globalFlags flags mempty -- ClientInstallFlags, not needed here
     globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
 
+    findUnitId :: TargetsMap -> TargetSelector -> UnitId
+    findUnitId t selector =
+      case find (\(_, l) -> any ((selector `elem`) . snd) l) $ Map.assocs t of
+        Nothing -> error "CmdRepl, findUnitId"
+        Just (u, _) -> u
+
+    validatedTargets :: ElaboratedInstallPlan -> [TargetSelector] -> IO (TargetsMap, IsRepl)
     validatedTargets elaboratedPlan targetSelectors = do
       -- Interpret the targets on the command line as repl targets
       -- (as opposed to say build or haddock targets).
@@ -318,11 +326,14 @@ replAction flags@NixStyleFlags { extraFlags = (replFlags, envFlags), ..} targetS
       -- Reject multiple targets, or at least targets in different
       -- components. It is ok to have two module/file targets in the
       -- same component, but not two that live in different components.
-      when (Set.size (distinctTargetComponents targets) > 1) $
-        reportTargetProblems verbosity
-          [multipleTargetsProblem targets]
+      -- when (Set.size (distinctTargetComponents targets) > 1) $
+      --   reportTargetProblems verbosity
+      --     [multipleTargetsProblem targets]
 
-      return targets
+      let
+        nonEmptyTargetSelectors = NonEmpty.fromList targetSelectors
+        (root, rest) = (last nonEmptyTargetSelectors, init nonEmptyTargetSelectors)
+      return (targets, Repl (findUnitId targets root) $ map (findUnitId targets) rest)
 
 data OriginalComponentInfo = OriginalComponentInfo
   { ociUnitId :: UnitId
