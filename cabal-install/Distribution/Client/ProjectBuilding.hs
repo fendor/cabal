@@ -84,7 +84,7 @@ import qualified Distribution.Simple.Setup as Cabal
 import           Distribution.Simple.Command (CommandUI)
 import qualified Distribution.Simple.Register as Cabal
 import           Distribution.Simple.LocalBuildInfo
-                   ( ComponentName(..), LibraryName(..) )
+                   (LocalBuildInfo,  ComponentName(..), LibraryName(..) )
 import           Distribution.Simple.Compiler
                    ( Compiler, compilerId, PackageDB(..) )
 
@@ -104,6 +104,7 @@ import System.FilePath   (dropDrive, makeRelative, normalise, takeDirectory, (<.
 import System.IO         (IOMode (AppendMode), withFile)
 
 import Distribution.Compat.Directory (listDirectory)
+import Distribution.Simple.Configure (getPersistBuildConfig, localBuildInfoFile)
 
 
 ------------------------------------------------------------------------------
@@ -581,7 +582,7 @@ rebuildTargets verbosity
 
     -- Before traversing the install plan, pre-emptively find all packages that
     -- will need to be downloaded and start downloading them.
-    asyncDownloadPackages verbosity withRepoCtx
+    outcome <- asyncDownloadPackages verbosity withRepoCtx
                           installPlan pkgsBuildStatus $ \downloadMap ->
 
       -- For each package in the plan, in dependency order, but in parallel...
@@ -589,12 +590,12 @@ rebuildTargets verbosity
                           (BuildFailure Nothing . DependentFailed . packageId)
                           installPlan $ \pkg ->
         --TODO: review exception handling
-        handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $
+        handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $ do
 
         let uid = installedUnitId pkg
-            pkgBuildStatus = Map.findWithDefault (error "rebuildTargets") uid pkgsBuildStatus in
+            pkgBuildStatus = Map.findWithDefault (error "rebuildTargets") uid pkgsBuildStatus
 
-        rebuildTarget
+        b <- rebuildTarget
           verbosity
           distDirLayout
           storeDirLayout
@@ -603,6 +604,18 @@ rebuildTargets verbosity
           sharedPackageConfig
           installPlan pkg
           pkgBuildStatus
+        -- TODO, add filter
+        let lbiFp = localBuildInfoFile $ distDirectory
+        l <- getPersistBuildConfig lbiFp
+        pure (b, Just l)
+
+    let realOutcome = (fmap . fmap) fst outcome
+    let
+        e :: [Either BuildFailure (Maybe LocalBuildInfo)]
+        e = fmap (fmap snd) $ Map.elems outcome
+        lbis = mapMaybe (join . rightToMaybe) e
+
+    pure realOutcome
   where
     isParallelBuild = buildSettingNumJobs >= 2
     keepGoing       = buildSettingKeepGoing
@@ -616,6 +629,10 @@ rebuildTargets verbosity
                           , elabRegisterPackageDBStack elab
                           , elabSetupPackageDBStack elab ]
         ]
+
+    rightToMaybe :: Either e a -> Maybe a
+    rightToMaybe (Left e) = Nothing
+    rightToMaybe (Right a) = Just a
 
 
 -- | Create a package DB if it does not currently exist. Note that this action
