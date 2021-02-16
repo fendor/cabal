@@ -61,8 +61,7 @@ showBuildInfoCommand = CommandUI {
      ++ "  " ++ pname ++ " show-build-info .\n"
      ++ "    Shows build information about the current package\n"
      ++ "  " ++ pname ++ " show-build-info ./pkgname \n"
-     ++ "    Shows build information about the package located in './pkgname'\n"
-     ++ cmdCommonHelpTextNewBuildBeta,
+     ++ "    Shows build information about the package located in './pkgname'\n",
   commandOptions = nixStyleOptions $ \_ ->
       [ option [] ["buildinfo-json-output"]
               "Write the result to the given file instead of stdout"
