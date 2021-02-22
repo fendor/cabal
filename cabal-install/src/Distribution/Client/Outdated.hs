@@ -41,6 +41,8 @@ import Distribution.Types.ComponentRequestedSpec
        (ComponentRequestedSpec(..))
 import Distribution.Types.Dependency
        (Dependency(..))
+import Distribution.Version
+       (withinRange)
 import Distribution.Verbosity                        (silent)
 import Distribution.Version
        (Version, VersionInterval (..), VersionRange, LowerBound(..), UpperBound(..)
@@ -51,6 +53,7 @@ import Distribution.Types.PackageVersionConstraint
        (PackageVersionConstraint (..), simplifyPackageVersionConstraint)
 
 import qualified Data.Set as S
+import qualified Data.Map as M
 import System.Directory                              (getCurrentDirectory)
 
 -- | Entry point for the 'outdated' command.
@@ -84,6 +87,7 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
 
   sourcePkgDb <- IndexUtils.getSourcePackages verbosity repoContext
   let pkgIndex = packageIndex sourcePkgDb
+  let pkgPreference = packagePreferences sourcePkgDb
   deps <- if freezeFile
           then depsFromFreezeFile verbosity
           else if newFreezeFile
@@ -91,7 +95,7 @@ outdated verbosity0 outdatedFlags repoContext comp platform = do
                else depsFromPkgDesc verbosity comp platform
   debug verbosity $ "Dependencies loaded: "
     ++ (intercalate ", " $ map prettyShow deps)
-  let outdatedDeps = listOutdated deps pkgIndex
+  let outdatedDeps = listOutdated deps pkgPreference pkgIndex
                      (ListOutdatedSettings ignorePred minorPred)
   when (not quiet) $
     showResult verbosity outdatedDeps simpleOutput
@@ -168,16 +172,17 @@ depsFromPkgDesc verbosity comp platform = do
 data ListOutdatedSettings = ListOutdatedSettings {
   -- | Should this package be ignored?
   listOutdatedIgnorePred :: PackageName -> Bool,
-  -- | Should major version bumps should be ignored for this package?
+  -- | Should major version bumps be ignored for this package?
   listOutdatedMinorPred  :: PackageName -> Bool
   }
 
 -- | Find all outdated dependencies.
 listOutdated :: [PackageVersionConstraint]
+             -> Map PackageName VersionRange
              -> PackageIndex UnresolvedSourcePackage
              -> ListOutdatedSettings
              -> [(PackageVersionConstraint, Version)]
-listOutdated deps pkgIndex (ListOutdatedSettings ignorePred minorPred) =
+listOutdated deps pkgPreference pkgIndex (ListOutdatedSettings ignorePred minorPred) =
   mapMaybe isOutdated $ map simplifyPackageVersionConstraint deps
   where
     isOutdated :: PackageVersionConstraint -> Maybe (PackageVersionConstraint, Version)
@@ -185,8 +190,15 @@ listOutdated deps pkgIndex (ListOutdatedSettings ignorePred minorPred) =
       | ignorePred pname = Nothing
       | otherwise                   =
           let this   = map packageVersion $ lookupDependency pkgIndex pname vr
-              latest = lookupLatest dep
+              latest =
+                mapMaybe
+                  (\x -> case preferredVersion of
+                      Nothing -> Just x
+                      Just range -> if x `withinRange` range then Just x else Nothing)
+                $ lookupLatest dep
           in (\v -> (dep, v)) `fmap` isOutdated' this latest
+      where
+        preferredVersion =  M.lookup pname pkgPreference
 
     isOutdated' :: [Version] -> [Version] -> Maybe Version
     isOutdated' [] _  = Nothing
