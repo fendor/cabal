@@ -185,6 +185,27 @@ The part of the path will be used to determine the cache key part.
     as described in the previous sections, thus requiring manual construction
     of ``01-index.tar`` file.
 
+It is possible to define ``preferred-versions``, containing additional version constraints
+for deprecating or preferring certain package versions, in the given directory.
+
+For example, if ``/absolute/path/to/directory`` looks like
+::
+
+    /absolute/path/to/directory/
+        foo-0.1.0.0.tar.gz
+        bar-0.2.0.0.tar.gz
+        preferred-versions
+
+then package deprecations and preferences will be taken into account by the solver.
+
+The contents of ``preferred-versions`` is a list of package version constraints, e.g.
+::
+
+    binary < 0.8.0.0 || > 0.8.0.0
+    text == 1.2.0.0
+
+thus, looks similar to a ``package-name.cabal``'s ``build-depends`` section.
+
 Legacy repositories
 ^^^^^^^^^^^^^^^^^^^
 
