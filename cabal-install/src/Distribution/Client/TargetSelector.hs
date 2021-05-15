@@ -470,8 +470,11 @@ resolveTargetSelectors (KnownTargets{knownPackagesAll = []}) [] _ =
 resolveTargetSelectors (KnownTargets{knownPackagesPrimary = []}) [] _ =
     ([TargetSelectorNoTargetsInCwd], [])
 
-resolveTargetSelectors (KnownTargets{knownPackagesPrimary}) [] _ =
-    ([], [TargetPackage TargetImplicitCwd pkgids Nothing])
+resolveTargetSelectors (KnownTargets{knownPackagesPrimary}) [] _
+  | [pkgid] <- pkgids =
+    ([], [TargetPackage TargetImplicitCwd [pkgid] Nothing])
+  | otherwise =
+    ([TargetSelectorNotSinglePackage pkgids], [])
   where
     pkgids = [ pinfoId | KnownPackage{pinfoId} <- knownPackagesPrimary ]
 
@@ -593,6 +596,7 @@ data TargetSelectorProblem
    | TargetSelectorUnrecognised String
      -- ^ Syntax error when trying to parse a target string.
    | TargetSelectorNoCurrentPackage TargetString
+   | TargetSelectorNotSinglePackage [PackageId]
    | TargetSelectorNoTargetsInCwd
    | TargetSelectorNoTargetsInProject
    | TargetSelectorNoScript TargetString
@@ -806,15 +810,24 @@ reportTargetSelectorProblems verbosity problems = do
     case [ () | TargetSelectorNoTargetsInProject <- problems ] of
       []  -> return ()
       _:_ ->
-        die' verbosity $
-            "There is no <pkgname>.cabal package file or cabal.project file. "
-         ++ "To build packages locally you need at minimum a <pkgname>.cabal "
-         ++ "file. You can use 'cabal init' to create one.\n"
-         ++ "\n"
-         ++ "For non-trivial projects you will also want a cabal.project "
-         ++ "file in the root directory of your project. This file lists the "
-         ++ "packages in your project and all other build configuration. "
-         ++ "See the Cabal user guide for full details."
+        die' verbosity noPackageErrorMessage
+
+    case [ pkgids | TargetSelectorNotSinglePackage pkgids <- problems ] of
+      []      -> return ()
+      mpkgids ->
+        let
+          allpkgids = concat mpkgids
+        in
+          case allpkgids of
+            [] ->
+              die' verbosity noPackageErrorMessage
+            pkgids ->
+              die' verbosity $
+                  "Multiple packages have been found:\n  "
+               ++ unlines (map prettyShow pkgids)
+
+
+        where
 
     case [ t | TargetSelectorNoScript t <- problems ] of
       []  -> return ()
@@ -825,6 +838,16 @@ reportTargetSelectorProblems verbosity problems = do
          ++ "with ':'"
 
     fail "reportTargetSelectorProblems: internal error"
+  where
+    noPackageErrorMessage =
+            "There is no <pkgname>.cabal package file or cabal.project file. "
+         ++ "To build packages locally you need at minimum a <pkgname>.cabal "
+         ++ "file. You can use 'cabal init' to create one.\n"
+         ++ "\n"
+         ++ "For non-trivial projects you will also want a cabal.project "
+         ++ "file in the root directory of your project. This file lists the "
+         ++ "packages in your project and all other build configuration. "
+         ++ "See the Cabal user guide for full details."
 
 
 ----------------------------------
@@ -1777,16 +1800,16 @@ getKnownTargets dirActions@DirActions{..} pkgs = do
     mPkgDir :: KnownPackage -> Maybe FilePath
     mPkgDir KnownPackage { pinfoDirectory = Just (dir,_) } = Just dir
     mPkgDir _ = Nothing
-    
+
     selectPrimaryPackage :: FilePath
                          -> [KnownPackage]
                          -> m ([KnownPackage], [KnownPackage])
-    selectPrimaryPackage _ [] = return ([] , []) 
+    selectPrimaryPackage _ [] = return ([] , [])
     selectPrimaryPackage cwd (pkg : packages) = do
       (ppinfo, opinfo) <- selectPrimaryPackage cwd packages
       isPkgDirCwd <- maybe (pure False) (compareFilePath dirActions cwd) (mPkgDir pkg)
       return (if isPkgDirCwd then (pkg : ppinfo, opinfo) else (ppinfo, pkg : opinfo))
-       
+
     allComponentsIn ps =
       [ c | KnownPackage{pinfoComponents} <- ps, c <- pinfoComponents ]
 
