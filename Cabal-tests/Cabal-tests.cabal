@@ -35,6 +35,7 @@ test-suite unit-tests
     UnitTests.Distribution.Simple.Program.GHC
     UnitTests.Distribution.Simple.Program.Internal
     UnitTests.Distribution.Simple.Utils
+    UnitTests.Distribution.Simple.Utils.Json
     UnitTests.Distribution.SPDX
     UnitTests.Distribution.System
     UnitTests.Distribution.Types.GenericPackageDescription

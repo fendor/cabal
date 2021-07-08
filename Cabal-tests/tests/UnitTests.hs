@@ -20,6 +20,7 @@ import qualified UnitTests.Distribution.Simple.Glob
 import qualified UnitTests.Distribution.Simple.Program.GHC
 import qualified UnitTests.Distribution.Simple.Program.Internal
 import qualified UnitTests.Distribution.Simple.Utils
+import qualified UnitTests.Distribution.Simple.Utils.Json
 import qualified UnitTests.Distribution.System
 import qualified UnitTests.Distribution.Utils.CharSet
 import qualified UnitTests.Distribution.Utils.Generic
@@ -55,6 +56,8 @@ tests mtimeChangeCalibrated =
         UnitTests.Distribution.Simple.Program.Internal.tests
     , testGroup "Distribution.Simple.Utils" $
         UnitTests.Distribution.Simple.Utils.tests ghcPath
+    , testGroup "Distribution.Simple.Utils.Json" $
+        UnitTests.Distribution.Simple.Utils.Json.tests
     , testGroup "Distribution.Utils.Generic"
         UnitTests.Distribution.Utils.Generic.tests
     , testGroup "Distribution.Utils.NubList"
