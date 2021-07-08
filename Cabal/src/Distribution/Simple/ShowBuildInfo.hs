@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 -- |
 -- This module defines a simple JSON-based format for exporting basic
 -- information about a Cabal package and the compiler configuration Cabal
@@ -76,6 +77,8 @@ import Distribution.Text
 import Distribution.Pretty
 import Distribution.Utils.Path
 
+import Data.ByteString (ByteString)
+
 -- | Construct a JSON document describing the build information for a
 -- package.
 mkBuildInfo
@@ -89,7 +92,7 @@ mkBuildInfo pkg_descr lbi _flags targetsToBuild = info
     targetToNameAndLBI target =
       (componentLocalName $ targetCLBI target, targetCLBI target)
     componentsToBuild = map targetToNameAndLBI targetsToBuild
-    (.=) :: String -> Json -> (String, Json)
+    (.=) :: ByteString -> Json -> (ByteString, Json)
     k .= v = (k, v)
 
     info = JsonObject

@@ -88,6 +88,7 @@ import Distribution.Compat.Graph (IsNode(..))
 
 import Control.Monad
 import qualified Data.Set as Set
+import qualified Data.ByteString as BS
 import System.FilePath ( (</>), (<.>), takeDirectory )
 import System.Directory ( getCurrentDirectory )
 
@@ -136,13 +137,13 @@ build pkg_descr lbi flags suffixes = do
 showBuildInfo :: PackageDescription  -- ^ Mostly information from the .cabal file
   -> LocalBuildInfo      -- ^ Configuration information
   -> BuildFlags          -- ^ Flags that the user passed to build
-  -> IO String
+  -> IO BS.ByteString
 showBuildInfo pkg_descr lbi flags = do
   let verbosity = fromFlag (buildVerbosity flags)
   targets <- readTargetInfos verbosity pkg_descr lbi (buildArgs flags)
   let targetsToBuild = neededTargetsInBuildOrder' pkg_descr lbi (map nodeKey targets)
       doc = mkBuildInfo pkg_descr lbi flags targetsToBuild
-  return $ renderJson doc ""
+  return $ renderJson doc
 
 
 repl     :: PackageDescription  -- ^ Mostly information from the .cabal file

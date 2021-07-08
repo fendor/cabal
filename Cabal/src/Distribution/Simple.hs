@@ -104,6 +104,7 @@ import Distribution.Compat.Environment      (getEnvironment)
 import Distribution.Compat.GetShortPathName (getShortPathName)
 
 import Data.List       (unionBy, (\\))
+import qualified Data.ByteString as BS
 
 import Distribution.PackageDescription.Parsec
 
@@ -281,11 +282,11 @@ showBuildInfoAction hooks (ShowBuildInfoFlags flags fileOutput) args = do
       pkg_descr0 = localPkgDescr lbi'
       pkg_descr = updatePackageDescription pbi pkg_descr0
       -- TODO: Somehow don't ignore build hook?
-  buildInfoString <- showBuildInfo pkg_descr lbi' flags
+  buildInfoByteString <- showBuildInfo pkg_descr lbi' flags
 
   case fileOutput of
-    Nothing -> putStr buildInfoString
-    Just fp -> writeFile fp buildInfoString
+    Nothing -> BS.putStr buildInfoByteString
+    Just fp -> BS.writeFile fp buildInfoByteString
 
   postBuild hooks args flags' pkg_descr lbi'
 
