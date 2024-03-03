@@ -49,7 +49,6 @@ normalizeOutput nenv =
           "/incoming/new-<RAND>"
     -- Normalize architecture
   . resub (posixRegexEscape (display (normalizerPlatform nenv))) "<ARCH>"
-  . normalizeBuildInfoJson
     -- Some GHC versions are chattier than others
   . resub "^ignoring \\(possibly broken\\) abi-depends field for packages" ""
     -- Normalize the current GHC version.  Apply this BEFORE packageIdRegex,
@@ -63,6 +62,8 @@ normalizeOutput nenv =
                         ++ "(-[a-z0-9]+)?")
                    "<GHCVER>"
         else id)
+  . normalizeBuildInfoJson
+  . normalizePathCmdOutput
   -- hackage-security locks occur non-deterministically
   . resub "(Released|Acquired|Waiting) .*hackage-security-lock\n" ""
   where
@@ -70,12 +71,19 @@ normalizeOutput nenv =
         resub (posixRegexEscape (display pid) ++ "(-[A-Za-z0-9.-]+)?")
               (prettyShow (packageName pid) ++ "-<VERSION>")
 
+    normalizePathCmdOutput =
+      -- clear the ghc path out of all supported output formats
+      resub ("compiler-path: " <> posixRegexEscape (normalizerGhcPath nenv))
+          "compiler-path: <GHCPATH>"
+      . resub ("\"compiler-path\"\\s*:\\s*\"" <> posixRegexEscape (normalizerGhcPath nenv) <> "\"")
+          "\"compiler-path\": \"<GHCPATH>\""
+
     -- 'build-info.json' contains a plethora of host system specific information.
     --
     -- This must happen before the root-dir normalisation.
     normalizeBuildInfoJson =
         -- Remove ghc path from show-build-info output
-        resub ("\"path\":\"[^\"]*\"}")
+        resub ("\"path\":\"" <> posixRegexEscape (normalizerGhcPath nenv) <> "\"}")
           "\"path\":\"<GHCPATH>\"}"
         -- Remove cabal version output from show-build-info output
       . resub ("{\"cabal-version\":\"" ++ posixRegexEscape (display (normalizerCabalVersion nenv)) ++ "\"")
@@ -104,6 +112,7 @@ data NormalizerEnv = NormalizerEnv
     -- `/var` is a symlink for `/private/var`.
     , normalizerGblTmpDir     :: FilePath
     , normalizerGhcVersion    :: Version
+    , normalizerGhcPath    :: FilePath
     , normalizerKnownPackages :: [PackageId]
     , normalizerPlatform      :: Platform
     , normalizerCabalVersion  :: Version

@@ -300,6 +300,10 @@ runTestM mode m =
                 program_db1
                 verbosity
 
+    ghcLocation <- case lookupProgramByName "ghc" program_db2 of
+        Nothing -> fail "runTestM.lookupProgramByName: No location for 'ghc' was found"
+        Just ghcProg -> pure $ programPath ghcProg
+
     program_db3 <-
         reconfigurePrograms verbosity
             ([("cabal", p)   | p <- maybeToList (argCabalInstallPath cargs)] ++
@@ -321,6 +325,7 @@ runTestM mode m =
                     testProgramDb = program_db,
                     testPlatform = platform,
                     testCompiler = comp,
+                    testCompilerPath =  ghcLocation,
                     testPackageDBStack = db_stack,
                     testVerbosity = verbosity,
                     testMtimeChangeDelay = Nothing,
@@ -536,6 +541,8 @@ mkNormalizerEnv = do
             = addTrailingPathSeparator tmpDir,
         normalizerGhcVersion
             = compilerVersion (testCompiler env),
+        normalizerGhcPath
+            = testCompilerPath env,
         normalizerKnownPackages
             = mapMaybe simpleParse (words list_out),
         normalizerPlatform
@@ -605,6 +612,7 @@ data TestEnv = TestEnv
     , testProgramDb     :: ProgramDb
     -- | Compiler we are running tests for
     , testCompiler      :: Compiler
+    , testCompilerPath  :: FilePath
     -- | Platform we are running tests on
     , testPlatform      :: Platform
     -- | Package database stack (actually this changes lol)
