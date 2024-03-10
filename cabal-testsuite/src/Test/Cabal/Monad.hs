@@ -300,9 +300,7 @@ runTestM mode m =
                 program_db1
                 verbosity
 
-    ghcLocation <- case lookupProgramByName "ghc" program_db2 of
-        Nothing -> fail "runTestM.lookupProgramByName: No location for 'ghc' was found"
-        Just ghcProg -> pure $ programPath ghcProg
+    (configuredGhcProg, _) <- requireProgram verbosity ghcProgram program_db2
 
     program_db3 <-
         reconfigurePrograms verbosity
@@ -325,7 +323,7 @@ runTestM mode m =
                     testProgramDb = program_db,
                     testPlatform = platform,
                     testCompiler = comp,
-                    testCompilerPath =  ghcLocation,
+                    testCompilerPath = programPath configuredGhcProg,
                     testPackageDBStack = db_stack,
                     testVerbosity = verbosity,
                     testMtimeChangeDelay = Nothing,
@@ -530,6 +528,16 @@ mkNormalizerEnv = do
 
     canonicalizedTestTmpDir <- liftIO $ canonicalizePath (testTmpDir env)
 
+    -- 'cabal' is configured in the package-db, but doesn't specify how to find the program version
+    -- Thus we find the program location, if it exists, and query for the program version for
+    -- output normalisation.
+    cabalVersionM <- do
+        cabalProgM <- needProgramM "cabal"
+        case cabalProgM of
+            Nothing -> pure Nothing
+            Just cabalProg -> do
+                liftIO (findProgramVersion "--numeric-version" id (testVerbosity env) (programPath cabalProg))
+
     return NormalizerEnv {
         normalizerRoot
             = addTrailingPathSeparator (testSourceDir env),
@@ -548,7 +556,9 @@ mkNormalizerEnv = do
         normalizerPlatform
             = testPlatform env,
         normalizerCabalVersion
-            = cabalVersionLibrary
+            = cabalVersionLibrary,
+        normalizerCabalInstallVersion
+            = cabalVersionM
     }
 
 cabalVersionLibrary :: Version
@@ -560,6 +570,11 @@ requireProgramM program = do
     (configured_program, _) <- liftIO $
         requireProgram (testVerbosity env) program (testProgramDb env)
     return configured_program
+
+needProgramM :: String -> TestM (Maybe ConfiguredProgram)
+needProgramM program = do
+    env <- getTestEnv
+    return $ lookupProgramByName program (testProgramDb env)
 
 programPathM :: Program -> TestM FilePath
 programPathM program = do

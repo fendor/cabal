@@ -63,7 +63,7 @@ normalizeOutput nenv =
                    "<GHCVER>"
         else id)
   . normalizeBuildInfoJson
-  . normalizePathCmdOutput
+  . maybe id normalizePathCmdOutput (normalizerCabalInstallVersion nenv)
   -- hackage-security locks occur non-deterministically
   . resub "(Released|Acquired|Waiting) .*hackage-security-lock\n" ""
   where
@@ -71,12 +71,14 @@ normalizeOutput nenv =
         resub (posixRegexEscape (display pid) ++ "(-[A-Za-z0-9.-]+)?")
               (prettyShow (packageName pid) ++ "-<VERSION>")
 
-    normalizePathCmdOutput =
+    normalizePathCmdOutput cabalInstallVersion =
       -- clear the ghc path out of all supported output formats
       resub ("compiler-path: " <> posixRegexEscape (normalizerGhcPath nenv))
           "compiler-path: <GHCPATH>"
       . resub ("\"compiler-path\"\\s*:\\s*\"" <> posixRegexEscape (normalizerGhcPath nenv) <> "\"")
           "\"compiler-path\": \"<GHCPATH>\""
+      . resub (display cabalInstallVersion)
+          "<CABAL_INSTALL_VER>"
 
     -- 'build-info.json' contains a plethora of host system specific information.
     --
@@ -116,6 +118,7 @@ data NormalizerEnv = NormalizerEnv
     , normalizerKnownPackages :: [PackageId]
     , normalizerPlatform      :: Platform
     , normalizerCabalVersion  :: Version
+    , normalizerCabalInstallVersion :: Maybe Version
     }
 
 posixSpecialChars :: [Char]
