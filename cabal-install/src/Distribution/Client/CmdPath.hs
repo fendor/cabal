@@ -2,6 +2,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE EmptyCase #-}
 
 -----------------------------------------------------------------------------
 
@@ -135,19 +138,62 @@ data PathOutputFormat
   | KeyValue
   deriving (Eq, Ord, Show, Read, Enum, Bounded)
 
+data PathQuery where
+  QueryCompiler :: PathQuery
+  QueryConfigPathCacheDir :: PathQuery
+  QueryConfigPathLogsDir :: PathQuery
+  QueryConfigPathStoreDir :: PathQuery
+  QueryConfigPathConfigFile :: PathQuery
+  QueryConfigPathInstallDir :: PathQuery
+
+deriving instance Show PathQuery
+deriving instance Eq PathQuery
+deriving instance Ord PathQuery
+deriving instance Enum PathQuery
+deriving instance Bounded PathQuery
+
+flagName :: PathQuery -> String
+flagName = \case
+  QueryCompiler -> "compiler-info"
+  QueryConfigPathCacheDir -> "cache-dir"
+  QueryConfigPathLogsDir -> "logs-dir"
+  QueryConfigPathStoreDir -> "store-dir"
+  QueryConfigPathConfigFile -> "config-file"
+  QueryConfigPathInstallDir -> "install-dir"
+
+flagDescription :: PathQuery -> String
+flagDescription = \case
+  QueryCompiler -> "Print information of the project compiler"
+  QueryConfigPathCacheDir -> "Print cabal's cache-dir"
+  QueryConfigPathLogsDir -> "Print cabal's logs-dir"
+  QueryConfigPathStoreDir -> "Print cabal's store-dir"
+  QueryConfigPathConfigFile -> "Print cabal's config-file"
+  QueryConfigPathInstallDir -> "Print cabal's install-dir"
+
+flagSpecification :: PathQuery -> OptionField PathFlags
+flagSpecification fl = simplePathOption fl
+  where
+    simplePathOption s =
+      option
+        []
+        [flagName s]
+        (flagDescription s)
+        pathQueries
+        (\v flags -> flags{pathQueries = Flag $ concat (flagToList (pathQueries flags) <> flagToList v)})
+        (noArg (Flag [s]))
+
+
 data PathFlags = PathFlags
-  { pathCompiler :: Flag Bool
-  , pathOutputFormat :: Flag PathOutputFormat
-  , pathDirectories :: Flag [ConfigPath]
+  { pathOutputFormat :: Flag PathOutputFormat
+  , pathQueries :: Flag [PathQuery]
   }
   deriving (Eq, Show)
 
 defaultPathFlags :: PathFlags
 defaultPathFlags =
   PathFlags
-    { pathCompiler = mempty
-    , pathOutputFormat = mempty
-    , pathDirectories = mempty
+    { pathOutputFormat = mempty
+    , pathQueries = mempty
     }
 
 pathOutputFormatParser :: ReadE (Flag PathOutputFormat)
@@ -171,7 +217,7 @@ pathOutputFormatPrinter = \case
   NoFlag -> []
 
 pathOptions :: ShowOrParseArgs -> [OptionField PathFlags]
-pathOptions showOrParseArgs =
+pathOptions _ =
   [ option
       []
       ["output-format"]
@@ -183,24 +229,8 @@ pathOptions showOrParseArgs =
           pathOutputFormatParser
           pathOutputFormatPrinter
       )
-  , option
-      []
-      ["compiler-info"]
-      "Print information of the project compiler"
-      pathCompiler
-      (\v flags -> flags{pathCompiler = v})
-      (yesNoOpt showOrParseArgs)
   ]
-    <> map pathOption [minBound .. maxBound]
-  where
-    pathOption s =
-      option
-        []
-        [pathName s]
-        ("Print cabal's " <> pathName s)
-        pathDirectories
-        (\v flags -> flags{pathDirectories = Flag $ concat (flagToList (pathDirectories flags) <> flagToList v)})
-        (noArg (Flag [s]))
+    <> map flagSpecification [minBound .. maxBound]
 
 -- | A path that can be retrieved by the @cabal path@ command.
 data ConfigPath
@@ -223,16 +253,44 @@ pathName ConfigPathInstallDir = "installdir"
 -- Action
 -------------------------------------------------------------------------------
 
+requiresProgramDb = \case
+  QueryCompiler -> True
+  _ -> False
+
+querySimplePathWithProjectContext :: ProjectBaseContext -> PathQuery -> IO FilePath
+querySimplePathWithProjectContext baseCtx = \case
+  QueryConfigPathCacheDir ->
+    pure $ buildSettingCacheDir (buildSettings baseCtx)
+  QueryConfigPathLogsDir ->
+    pure $ cabalLogsDirectory (cabalDirLayout baseCtx)
+  QueryConfigPathStoreDir ->
+    fromFlagOrDefault
+      defaultStoreDir
+      (pure <$> projectConfigStoreDir (projectConfigShared (projectConfig baseCtx)))
+  QueryConfigPathConfigFile ->
+    getConfigFilePath (projectConfigConfigFile (projectConfigShared (projectConfig baseCtx)))
+  QueryConfigPathInstallDir ->
+    fromFlagOrDefault
+      defaultInstallPath
+      (pure <$> cinstInstalldir (projectConfigClientInstallFlags $ projectConfigBuildOnly (projectConfig baseCtx)))
+  _ -> undefined
+
+queryPathWithProgramDb :: ProjectBaseContext -> _ -> PathQuery -> IO CompilerInfo
+queryPathWithProgramDb _ (compiler, _, progDb) = \case
+  QueryCompiler -> do
+    compilerProg <- requireCompilerProg verbosity compiler
+    (configuredCompilerProg, _) <- requireProgram verbosity compilerProg progDb
+    pure $ Just $ mkCompilerInfo configuredCompilerProg compiler
+
 -- | Entry point for the 'path' command.
 pathAction :: NixStyleFlags PathFlags -> [String] -> GlobalFlags -> IO ()
 pathAction flags@NixStyleFlags{extraFlags = pathFlags', ..} cliTargetStrings globalFlags = withContextAndSelectors AcceptNoTargets Nothing flags [] globalFlags OtherCommand $ \_ baseCtx _ -> do
   let pathFlags =
-        if pathCompiler pathFlags' == NoFlag && pathDirectories pathFlags' == NoFlag
+        if pathQueries pathFlags' == NoFlag
           then -- if not a single key to query is given, query everything!
 
             pathFlags'
-              { pathCompiler = Flag True
-              , pathDirectories = Flag [minBound .. maxBound]
+              { pathQueries = Flag [minBound .. maxBound]
               }
           else pathFlags'
   when (NoFlag == pathOutputFormat pathFlags) $
