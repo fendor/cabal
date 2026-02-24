@@ -1,0 +1,9 @@
+{
+  "lsp": {
+    "hls": {
+      "settings": {
+        "sessionLoading": "multipleComponents"
+      }
+    }
+  }
+}
