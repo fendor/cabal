@@ -7,7 +7,7 @@ import Test.Cabal.Monad
 import Test.Cabal.TestCode
 
 import Distribution.Verbosity
-import Distribution.Simple.Utils     (getDirectoryContentsRecursive)
+import Distribution.Simple.Utils     (getDirectoryContentsRecursiveOsPath, toUTF8LBS)
 import Distribution.Simple.Program
 import Distribution.Utils.Path       (getSymbolicPath)
 
@@ -34,13 +34,21 @@ import qualified Test.Tasty.Runners as Tasty
   )
 import qualified System.Clock as Clock
 import System.IO
-import System.FilePath
+import System.OsPath
+-- import System.FilePath
 import System.Exit
 import System.Process (readProcessWithExitCode, showCommandForUser)
-import System.Directory
+-- import System.Directory
+import System.Directory.Internal ( os )
 import Distribution.Pretty
 import Data.Maybe
-
+import Data.ByteString.Lazy (ByteString)
+import System.Directory.OsPath
+import qualified System.File.OsPath as FileIO
+import qualified System.OsString as OsString
+import qualified Options.Applicative as OA
+import qualified System.Process.Environment.OsString
+import Debug.Trace
 
 {- Note [Testsuite package environments]
 
@@ -74,27 +82,32 @@ package databases (yet).
 -- | Record for arguments that can be passed to @cabal-tests@ executable.
 data MainArgs = MainArgs {
         mainArgThreads :: Int,
-        mainArgTestPaths :: [String],
+        mainArgTestPaths :: [OsString],
         mainArgHideSuccesses :: Bool,
         mainArgVerbose :: Bool,
         mainArgQuiet   :: Bool,
-        mainArgDistDir :: Maybe FilePath,
+        mainArgDistDir :: Maybe OsPath,
         mainArgCabalSpec :: Maybe CabalLibSpec,
         mainCommonArgs :: CommonArgs,
         mainTastyArgs :: Tasty.OptionSet
     }
 
-data CabalLibSpec = BootCabalLib | InTreeCabalLib FilePath FilePath | SpecificCabalLib String FilePath
+data CabalLibSpec = BootCabalLib | InTreeCabalLib OsPath OsPath | SpecificCabalLib String OsPath
 
 cabalLibSpecParser :: Parser CabalLibSpec
 cabalLibSpecParser = bootParser <|> intreeParser <|> specificParser
   where
     bootParser = flag' BootCabalLib (long "boot-cabal-lib")
-    intreeParser = InTreeCabalLib <$> strOption (long "intree-cabal-lib" <> metavar "ROOT")
-                                  <*> option str ( help "Test TMP" <> long "test-tmp" )
+    intreeParser = InTreeCabalLib <$> option osPath (long "intree-cabal-lib" <> metavar "ROOT")
+                                  <*> option osPath ( help "Test TMP" <> long "test-tmp" )
     specificParser = SpecificCabalLib <$> strOption (long "specific-cabal-lib" <> metavar "VERSION")
-                                      <*> option str ( help "Test TMP" <> long "test-tmp" )
+                                      <*> option osPath ( help "Test TMP" <> long "test-tmp" )
 
+
+osPath :: ReadM OsPath
+osPath = OA.str >>= \fp -> case encodeUtf fp of
+  Right txt -> pure txt
+  Left ex -> fail $ "failed: " ++ displayException ex
 
 -- | optparse-applicative parser for 'MainArgs'
 mainArgParser :: Parser MainArgs
@@ -105,7 +118,7 @@ mainArgParser = MainArgs
        <> showDefault
        <> value numCapabilities
        <> metavar "INT")
-    <*> many (argument str (metavar "FILE"))
+    <*> many (argument osPath (metavar "FILE"))
     <*> switch
         ( long "hide-successes"
        <> help "Do not print test cases as they are being run"
@@ -120,7 +133,7 @@ mainArgParser = MainArgs
        <> short 'q'
        <> help "Only output stderr on failure"
         )
-    <*> optional (option str
+    <*> optional (option osPath
         ( help "Dist directory we were built with"
        <> long "builddir"
        <> metavar "DIR"))
@@ -139,59 +152,72 @@ tastyArgParser =
          else error $ unlines ("Failed to create parser for Tasty CLI options:" : warnings)
 
 -- Unpack and build a specific released version of Cabal and Cabal-syntax libraries
-buildCabalLibsProject :: String -> Verbosity -> Maybe FilePath -> FilePath -> IO [FilePath]
+buildCabalLibsProject :: ByteString -> Verbosity -> Maybe String -> OsPath -> IO [OsPath]
 buildCabalLibsProject projString verb mbGhc dir = do
   let prog_db = userSpecifyPaths [("ghc", path) | Just path <- [mbGhc] ]  defaultProgramDb
   (cabal, _) <- requireProgram verb (simpleProgram "cabal") prog_db
   (ghc, _) <- requireProgram verb ghcProgram prog_db
 
-  let storeRoot = dir </> "store"
+  dirFp <- decodeUtf dir
+  let storeRoot = dir </> os "store"
+  storeRootFp <- decodeUtf storeRoot
+  projectFile <- decodeUtf $ dir </> os "cabal.project-test"
   let pv = fromMaybe (error "no ghc version") (programVersion ghc)
-  let final_package_db = dir </> "dist-newstyle" </> "packagedb" </> "ghc-" ++ prettyShow pv
+  let final_package_db = dir </> os "dist-newstyle" </> os "packagedb" </> os ("ghc-" ++ prettyShow pv)
   createDirectoryIfMissing True dir
-  writeFile (dir </> "cabal.project-test") projString
+  FileIO.writeFile (dir </> os "cabal.project-test") projString
 
   runProgramInvocation verb
     ((programInvocation cabal
-      ["--store-dir", storeRoot
-      , "--project-file=" ++ dir </> "cabal.project-test"
+      ["--store-dir", storeRootFp
+      , "--project-file", projectFile
       , "build"
       , "-w", programPath ghc
       , "Cabal", "Cabal-syntax", "Cabal-hooks", "hooks-exe"
-      ] ) { progInvokeCwd = Just dir })
+      ] ) { progInvokeCwd = Just dirFp })
 
   -- Determine the path to the packagedb in the store for this ghc version
   storesByGhc <- listDirectory storeRoot
-  case filter (prettyShow pv `isInfixOf`) storesByGhc of
+  case filter (os (prettyShow pv) `OsString.isInfixOf`) storesByGhc of
     [] -> return [final_package_db]
     storeForGhc:_ -> do
-      let storePackageDB = storeRoot </> storeForGhc </> "package.db"
+      let storePackageDB = storeRoot </> storeForGhc </> os "package.db"
       return [storePackageDB, final_package_db]
 
 
 
-buildCabalLibsSpecific :: String -> Verbosity -> Maybe FilePath -> FilePath -> IO [FilePath]
+buildCabalLibsSpecific :: String -> Verbosity -> Maybe FilePath -> OsPath -> IO [OsPath]
 buildCabalLibsSpecific ver verb mbGhc builddir_rel = do
   let prog_db = userSpecifyPaths [("ghc", path) | Just path <- [mbGhc] ]  defaultProgramDb
   (cabal, _) <- requireProgram verb (simpleProgram "cabal") prog_db
-  dir <- canonicalizePath (builddir_rel </> "specific" </> ver)
-  cgot <- doesDirectoryExist (dir </> "Cabal-" ++ ver)
+  dir <- canonicalizePath (builddir_rel </> os "specific" </> os ver)
+  dirFp <- decodeUtf dir
+  cgot <- doesDirectoryExist (dir </> os ("Cabal-" ++ ver))
   unless cgot $
-    runProgramInvocation verb ((programInvocation cabal ["get", "Cabal-" ++ ver]) { progInvokeCwd = Just dir })
-  csgot <- doesDirectoryExist (dir </> "Cabal-syntax-" ++ ver)
+    runProgramInvocation verb ((programInvocation cabal ["get", "Cabal-" ++ ver]) { progInvokeCwd = Just dirFp })
+  csgot <- doesDirectoryExist (dir </> os ("Cabal-syntax-" ++ ver))
   unless csgot $
-    runProgramInvocation verb ((programInvocation cabal ["get", "Cabal-syntax-" ++ ver]) { progInvokeCwd = Just dir })
-  chgot <- doesDirectoryExist (dir </> "Cabal-hooks-" ++ ver)
+    runProgramInvocation verb ((programInvocation cabal ["get", "Cabal-syntax-" ++ ver]) { progInvokeCwd = Just dirFp })
+  chgot <- doesDirectoryExist (dir </> os ("Cabal-hooks-" ++ ver))
   unless chgot $
-    runProgramInvocation verb ((programInvocation cabal ["get", "Cabal-hooks-" ++ ver]) { progInvokeCwd = Just dir })
-  buildCabalLibsProject ("packages: Cabal-" ++ ver ++ " Cabal-syntax-" ++ ver ++ " Cabal-hooks-" ++ ver) verb mbGhc dir
+    runProgramInvocation verb ((programInvocation cabal ["get", "Cabal-hooks-" ++ ver]) { progInvokeCwd = Just dirFp })
+  buildCabalLibsProject (toUTF8LBS $ "packages: Cabal-" ++ ver ++ " Cabal-syntax-" ++ ver ++ " Cabal-hooks-" ++ ver) verb mbGhc dir
 
 
-buildCabalLibsIntree :: String -> Verbosity -> Maybe FilePath -> FilePath -> IO [FilePath]
+buildCabalLibsIntree :: OsPath -> Verbosity -> Maybe FilePath -> OsPath -> IO [OsPath]
 buildCabalLibsIntree root verb mbGhc builddir_rel = do
-  dir <- canonicalizePath (builddir_rel </> "intree")
-  let libs = [ "Cabal", "Cabal-syntax", "Cabal-hooks", "hooks-exe" ]
-  buildCabalLibsProject ("packages: " ++ unwords ( map ( root </> ) libs ) ) verb mbGhc dir
+  dir <- canonicalizePath (builddir_rel </> os "intree")
+  let libs = map os [ "Cabal", "Cabal-syntax", "Cabal-hooks", "hooks-exe" ]
+  pkgs <- traverse ( decodeUtf . (root </>) ) libs
+  buildCabalLibsProject (toUTF8LBS $ "packages: " ++ unwords pkgs ) verb mbGhc dir
+
+myExecParser :: ParserInfo b -> IO b
+myExecParser pinfo = do
+  oss <- System.Process.Environment.OsString.getArgs
+  traceShowM oss
+  ps <- traverse decodeUtf oss
+  traceShowM ps
+  OA.handleParseResult $ OA.execParserPure OA.defaultPrefs pinfo ps
 
 main :: IO ()
 main = do
@@ -201,7 +227,7 @@ main = do
     hSetBuffering stderr LineBuffering
 
     -- Parse arguments.  N.B. 'helper' adds the option `--help`.
-    args <- execParser $ info (mainArgParser <**> helper) mempty
+    args <- myExecParser $ info (mainArgParser <**> helper) mempty
     let verbosity =
           mkVerbosity defaultVerbosityHandles $
             if mainArgVerbose args then verbose else normal
@@ -242,40 +268,47 @@ main = do
     -- for Custom.
     dist_dir <- case mainArgDistDir args of
                   Just dist_dir -> return dist_dir
-                  Nothing -> getSymbolicPath <$> guessDistDir
-    when (verbosityLevel verbosity >= Verbose) $
-        hPutStrLn stderr $ "Using dist dir: " ++ dist_dir
+                  Nothing -> encodeUtf . getSymbolicPath =<< guessDistDir
+    dist_dir_fp <- decodeUtf dist_dir
+    when (verbosityLevel verbosity >= Verbose) $ do
+        hPutStrLn stderr $ "Using dist dir: " ++ dist_dir_fp
     -- Get ready to go!
     senv <- mkScriptEnv verbosity
 
-    let runTest :: (Maybe cwd -> [unusedEnv] -> FilePath -> [String] -> IO result)
-                -> FilePath
+    let runTest :: (Maybe cwd -> [unusedEnv] -> FilePath -> [FilePath] -> IO result)
+                -> OsPath
                 -> IO result
-        runTest runner path
-            = runner Nothing [] path $
-                ["--builddir", dist_dir, path] ++ ["--extra-package-db=" ++ pkg_db | pkg_db <- pkg_dbs] ++ renderCommonArgs (mainCommonArgs args)
+        runTest runner path = do
+          path_fp <- decodeUtf path
+          pkg_dbs_fp <- traverse decodeUtf pkg_dbs
+          runner Nothing [] path_fp $
+            ["--builddir", dist_dir_fp, path_fp] ++ ["--extra-package-db=" ++ pkg_db | pkg_db <- pkg_dbs_fp] ++ renderCommonArgs (mainCommonArgs args)
 
     case mainArgTestPaths args of
         [path] -> do
             -- Simple runner
             (real_path, real_args) <- runTest (runnerCommand senv) path
-            hPutStrLn stderr $ showCommandForUser real_path real_args
-            -- If the test was reported flaky, the `runghc` call will exit
-            -- with exit code 1, and report `TestCodeFlaky` on the stderr output
-            --
-            -- This seems to be the only way to catch this case.
-            --
-            -- Sadly it means that stdout and stderr are not interleaved
-            -- directly anymore.
-            (e, out, err) <- readProcessWithExitCode real_path real_args ""
-            putStrLn "# STDOUT:"
-            putStrLn out
-            putStrLn "# STDERR:"
-            putStrLn err
-            if "TestCodeFlaky" `isInfixOf` err
-              then pure ()
-              else throwIO e
-            hPutStrLn stderr "OK"
+            case decodeUtf path of
+              Nothing -> do
+                hPutStrLn stderr "# SKIPPED: Unicode in paths not supported"
+              Just {} -> do
+                hPutStrLn stderr $ showCommandForUser real_path real_args
+                -- If the test was reported flaky, the `runghc` call will exit
+                -- with exit code 1, and report `TestCodeFlaky` on the stderr output
+                --
+                -- This seems to be the only way to catch this case.
+                --
+                -- Sadly it means that stdout and stderr are not interleaved
+                -- directly anymore.
+                (e, out, err) <- readProcessWithExitCode real_path real_args ""
+                putStrLn "# STDOUT:"
+                putStrLn out
+                putStrLn "# STDERR:"
+                putStrLn err
+                if "TestCodeFlaky" `isInfixOf` err
+                  then pure ()
+                  else throwIO e
+                hPutStrLn stderr "OK"
         user_paths -> do
             -- Read out tests from filesystem
             hPutStrLn stderr $ "threads: " ++ show (mainArgThreads args)
@@ -283,12 +316,10 @@ main = do
             test_scripts <- if null user_paths
                                 then findTests
                                 else return user_paths
-            -- NB: listDirectory is lazy IO, but it
-            -- doesn't handle directories disappearing gracefully. Fix
-            -- this!
-            (single_tests, multi_tests) <- evaluate (partitionTests testPattern test_scripts)
+
+            (single_tests, multi_tests) <- partitionTests testPattern test_scripts
             let all_tests = multi_tests ++ single_tests
-                margin = maximum (map length all_tests) + 2
+                margin = maximum (map OsString.length all_tests) + 2
             hPutStrLn stderr $ "tests to run: " ++ show (length all_tests)
 
             -- TODO: Get parallelization out of multitests by querying
@@ -325,8 +356,9 @@ main = do
                     case mb_work of
                         Nothing -> return ()
                         Just path -> do
+                            path_fp <- decodeUtf path
                             when (verbosityLevel verbosity >= Verbose) $
-                                logMeta $ "Running " ++ path
+                                logMeta $ "Running " ++ path_fp
                             start <- getTime
                             r <- runTest (runOnServer server) path
                             end <- getTime
@@ -335,7 +367,7 @@ main = do
 
                             unless (mainArgHideSuccesses args && code == TestCodeOk) $ do
                                 logMeta $
-                                    path ++ replicate (margin - length path) ' ' ++ displayTestCode code ++
+                                    path_fp ++ replicate (margin - length path_fp) ' ' ++ displayTestCode code ++
                                     if time >= 0.01
                                         then printf " (%.2fs)" time
                                         else ""
@@ -349,7 +381,7 @@ main = do
                                        "stderr:\n" ++ serverResultStderr r ++ "\n"
                                 logMeta $
                                           description
-                                       ++ "*** unexpected failure for " ++ path ++ "\n\n"
+                                       ++ "*** unexpected failure for " ++ path_fp ++ "\n\n"
                                 modifyMVar_ unexpected_fails_var $ \paths ->
                                     return (path:paths)
 
@@ -374,11 +406,11 @@ main = do
             -- run queue.
             replicateConcurrently_ (mainArgThreads args) (withNewServer chan senv go)
 
-            unexpected_fails  <- takeMVar unexpected_fails_var
-            unexpected_passes <- takeMVar unexpected_passes_var
-            skipped           <- takeMVar skipped_var
-            flaky_passes      <- takeMVar flaky_pass_var
-            flaky_fails       <- takeMVar flaky_fail_var
+            unexpected_fails  <- traverse decodeUtf =<< takeMVar unexpected_fails_var
+            unexpected_passes <- traverse decodeUtf =<< takeMVar unexpected_passes_var
+            skipped           <- traverse decodeUtf =<< takeMVar skipped_var
+            flaky_passes      <- traverse decodeUtf =<< takeMVar flaky_pass_var
+            flaky_fails       <- traverse decodeUtf =<< takeMVar flaky_fail_var
 
             -- print summary
             let sl = show . length
@@ -400,28 +432,35 @@ main = do
                     "UNEXPECTED FAIL: " ++ unwords unexpected_fails
                 exitFailure
 
-findTests :: IO [FilePath]
-findTests = getDirectoryContentsRecursive "."
+findTests :: IO [OsPath]
+findTests = getDirectoryContentsRecursiveOsPath (os ".")
 
 -- | Partition a list of paths into a tuple of test paths and multi-test paths.
 --
 -- Non-test paths and test paths that don't match the given `Tasty.TestPattern` are dropped.
-partitionTests :: Tasty.TestPattern -> [FilePath] -> ([FilePath], [FilePath])
+partitionTests :: Tasty.TestPattern -> [OsPath] -> IO ([OsPath], [OsPath])
 partitionTests testPattern paths =
   go [] [] paths
   where
     -- Filter a list, keeping only paths that match the @pattern@.
-    keepPatternMatches = filter (Tasty.testPatternMatches testPattern . toTastyPath)
+    keepPatternMatches =
+      filterM (\ p -> do
+        tasty_path <- toTastyPath p
+        pure $ Tasty.testPatternMatches testPattern tasty_path)
 
-    toTastyPath path = Seq.fromList $ splitDirectories path
+    toTastyPath path = do
+      path_segments <- traverse decodeUtf $ splitDirectories path
+      pure $ Seq.fromList path_segments
 
-    go ts ms [] = (keepPatternMatches ts, keepPatternMatches ms)
+    go ts ms [] = do
+      (,) <$> keepPatternMatches ts <*> keepPatternMatches ms
     go ts ms (f:fs) =
         -- NB: Keep this synchronized with isTestFile
         case takeExtensions f of
-            ".test.hs"      -> go (f:ts) ms fs
-            ".multitest.hs" -> go ts (f:ms) fs
-            _               -> go ts ms     fs
+            ext
+              | ext == os ".test.hs"      -> go (f:ts) ms fs
+              | ext == os ".multitest.hs" -> go ts (f:ms) fs
+              | otherwise                 -> go ts ms     fs
 
 outputThread :: Verbosity -> Chan ServerLogMsg -> Handle -> IO ()
 outputThread verbosity chan log_handle = go ""

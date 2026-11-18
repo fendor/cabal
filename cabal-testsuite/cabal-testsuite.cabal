@@ -106,8 +106,11 @@ executable cabal-tests
     , optparse-applicative
     , process
     -- dependencies specific to exe:cabal-tests
+    , bytestring
     , clock                 ^>= 0.7.2 || ^>=0.8
     , directory
+    , file-io               ^>= 0.2.0
+    , os-string             ^>= 2.0.11
     , tasty
     , containers
 

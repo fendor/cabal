@@ -133,6 +133,7 @@ module Distribution.Simple.Utils
   , findModuleFilesEx
   , findModuleFilesCwd
   , getDirectoryContentsRecursive
+  , getDirectoryContentsRecursiveOsPath
 
     -- * environment variables
   , isInSearchPath
@@ -270,6 +271,9 @@ import System.Directory
   , removeFile
   , removePathForcibly
   )
+import System.Directory.Internal
+  ( os
+  )
 import System.Environment
   ( getProgName
   )
@@ -317,6 +321,11 @@ import GitHash
   , giCommitDate
   , tGitInfoCwdTry
   )
+import System.OsPath (OsPath)
+import qualified System.OsPath as OsPath
+import qualified System.Directory.OsPath as OsPath
+import Control.Monad ((>=>))
+
 #endif
 
 #if MIN_VERSION_base(4,21,0)
@@ -1575,12 +1584,15 @@ findModuleFileCwd verbosity cwd searchPath extensions mod_name = do
 -- parent directories. The list is generated lazily so is not well defined if
 -- the source directory structure changes before the list is used.
 getDirectoryContentsRecursive :: FilePath -> IO [FilePath]
-getDirectoryContentsRecursive topdir = recurseDirectories [""]
+getDirectoryContentsRecursive = OsPath.encodeUtf >=> getDirectoryContentsRecursiveOsPath >=> traverse OsPath.decodeUtf
+
+getDirectoryContentsRecursiveOsPath :: OsPath -> IO [OsPath]
+getDirectoryContentsRecursiveOsPath topdir = recurseDirectories [os ""]
   where
-    recurseDirectories :: [FilePath] -> IO [FilePath]
+    recurseDirectories :: [OsPath] -> IO [OsPath]
     recurseDirectories [] = return []
     recurseDirectories (dir : dirs) = unsafeInterleaveIO $ do
-      (files, dirs') <- collect [] [] =<< listDirectory (topdir </> dir)
+      (files, dirs') <- collect [] [] =<< OsPath.listDirectory (topdir OsPath.</> dir)
       files' <- recurseDirectories (dirs' ++ dirs)
       return (files ++ files')
       where
@@ -1590,8 +1602,8 @@ getDirectoryContentsRecursive topdir = recurseDirectories [""]
             , reverse dirs'
             )
         collect files dirs' (entry : entries) = do
-          let dirEntry = dir </> entry
-          isDirectory <- doesDirectoryExist (topdir </> dirEntry)
+          let dirEntry = dir OsPath.</> entry
+          isDirectory <- OsPath.doesDirectoryExist (topdir OsPath.</> dirEntry)
           if isDirectory
             then collect files (dirEntry : dirs') entries
             else collect (dirEntry : files) dirs' entries
